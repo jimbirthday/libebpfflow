@@ -2,12 +2,10 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -78,126 +76,12 @@ type IntervalStats struct {
 	LastStats    map[string]*ProcessStats // 添加上一个间隔的统计
 }
 
-// 流量统计文件结构
-type TrafficStatsFile struct {
-	Date      string `json:"date"`
-	Timestamp string `json:"timestamp"`
-	Period    struct {
-		StartTime string `json:"start_time"`
-		EndTime   string `json:"end_time"`
-	} `json:"period"`
-	TotalStats           *NetworkEventStats       `json:"total_stats"`
-	IntervalStats        *NetworkEventStats       `json:"interval_stats"`
-	ProcessStats         map[string]*ProcessStats `json:"process_stats"`
-	ProcessIntervalStats map[string]*ProcessStats `json:"process_interval_stats"`
-}
-
-// 文件存储管理器
-type FileStorageManager struct {
-	baseDir          string
-	totalStatsFile   *os.File
-	processStatsFile *os.File
-	currentDate      string
-	mu               sync.Mutex
-	writeChan        chan *TrafficStatsFile
-}
-
-func NewFileStorageManager(baseDir string) *FileStorageManager {
-	fsm := &FileStorageManager{
-		baseDir:   baseDir,
-		writeChan: make(chan *TrafficStatsFile, 100), // 缓冲通道，避免阻塞
-	}
-
-	// 确保目录存在
-	os.MkdirAll(baseDir, 0755)
-
-	// 启动异步写入协程
-	go fsm.asyncWriter()
-
-	return fsm
-}
-
-func (fsm *FileStorageManager) asyncWriter() {
-	for stats := range fsm.writeChan {
-		fsm.writeStatsToFile(stats)
-	}
-}
-
-func (fsm *FileStorageManager) writeStatsToFile(stats *TrafficStatsFile) {
-	fsm.mu.Lock()
-	defer fsm.mu.Unlock()
-
-	// 检查是否需要切换文件
-	if fsm.currentDate != stats.Date {
-		fsm.rotateFiles(stats.Date)
-	}
-
-	// 序列化数据
-	data, err := json.MarshalIndent(stats, "", "  ")
-	if err != nil {
-		fmt.Printf("Error marshaling stats: %v\n", err)
-		return
-	}
-
-	// 写入总流量统计
-	if fsm.totalStatsFile != nil {
-		if _, err := fsm.totalStatsFile.Write(append(data, '\n')); err != nil {
-			fmt.Printf("Error writing total stats: %v\n", err)
-		}
-	}
-
-	// 写入进程流量统计
-	if fsm.processStatsFile != nil {
-		if _, err := fsm.processStatsFile.Write(append(data, '\n')); err != nil {
-			fmt.Printf("Error writing process stats: %v\n", err)
-		}
-	}
-}
-
-func (fsm *FileStorageManager) rotateFiles(date string) {
-	// 关闭旧文件
-	if fsm.totalStatsFile != nil {
-		fsm.totalStatsFile.Close()
-	}
-	if fsm.processStatsFile != nil {
-		fsm.processStatsFile.Close()
-	}
-
-	// 创建新文件
-	totalStatsPath := filepath.Join(fsm.baseDir, fmt.Sprintf("total_stats_%s.json", date))
-	processStatsPath := filepath.Join(fsm.baseDir, fmt.Sprintf("process_stats_%s.json", date))
-
-	var err error
-	fsm.totalStatsFile, err = os.OpenFile(totalStatsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Error opening total stats file: %v\n", err)
-	}
-
-	fsm.processStatsFile, err = os.OpenFile(processStatsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		fmt.Printf("Error opening process stats file: %v\n", err)
-	}
-
-	fsm.currentDate = date
-}
-
-func (fsm *FileStorageManager) Close() {
-	close(fsm.writeChan)
-	if fsm.totalStatsFile != nil {
-		fsm.totalStatsFile.Close()
-	}
-	if fsm.processStatsFile != nil {
-		fsm.processStatsFile.Close()
-	}
-}
-
 type TrafficTracker struct {
 	processStats  map[string]*ProcessStats
 	networkStats  *NetworkEventStats
 	intervalStats *IntervalStats
 	mu            sync.RWMutex
-	connTimeout   time.Duration
-	fileManager   *FileStorageManager
+	connTimeout   time.Duration // 添加连接超时时间配置
 }
 
 func NewTrafficTracker() *TrafficTracker {
@@ -210,8 +94,7 @@ func NewTrafficTracker() *TrafficTracker {
 			StartTime:    time.Now(),
 			LastStats:    make(map[string]*ProcessStats),
 		},
-		connTimeout: 30 * time.Second,
-		fileManager: NewFileStorageManager("./traffic_stats"),
+		connTimeout: 30 * time.Second, // 默认30秒超时
 	}
 }
 
@@ -421,33 +304,6 @@ func (tt *TrafficTracker) printStats() {
 	// 清理不活跃的连接
 	tt.cleanupInactiveConnections()
 
-	// 准备写入文件的数据
-	now := time.Now()
-	stats := &TrafficStatsFile{
-		Date:      now.Format("2006-01-02"),
-		Timestamp: now.Format(time.RFC3339),
-		Period: struct {
-			StartTime string `json:"start_time"`
-			EndTime   string `json:"end_time"`
-		}{
-			StartTime: tt.intervalStats.StartTime.Format(time.RFC3339),
-			EndTime:   now.Format(time.RFC3339),
-		},
-		TotalStats:           tt.networkStats,
-		IntervalStats:        tt.intervalStats.NetworkStats,
-		ProcessStats:         tt.processStats,
-		ProcessIntervalStats: tt.intervalStats.ProcessStats,
-	}
-
-	// 异步写入文件
-	select {
-	case tt.fileManager.writeChan <- stats:
-		// 成功发送到写入通道
-	default:
-		// 通道已满，记录错误
-		fmt.Printf("Warning: Stats write channel is full, dropping stats\n")
-	}
-
 	fmt.Printf("\n==========================================\n")
 	fmt.Printf("=== TRAFFIC STATISTICS ===\n")
 	fmt.Printf("=== Period: %v - %v ===\n",
@@ -644,7 +500,6 @@ func (tt *TrafficTracker) resetIntervalStats() {
 func main() {
 	// 创建流量跟踪器
 	trafficTracker := NewTrafficTracker()
-	defer trafficTracker.fileManager.Close()
 
 	// 创建定时器，定期打印统计信息
 	ticker := time.NewTicker(10 * time.Second)
