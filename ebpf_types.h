@@ -40,6 +40,8 @@ typedef enum {
   eUDP_SEND = 211,
   eTCP_CLOSE = 300,
   eTCP_CONN_FAIL = 500,
+  eTCP_SEND = 600,
+  eTCP_RECV = 601
 } event_type;
 
 struct taskInfo {
@@ -72,6 +74,7 @@ typedef struct {
   struct timeval event_time;
   u_int8_t ip_version, sent_packet;
   u16 etype;
+  u32 len; // Packet length
 
   union {
     struct ipv4_addr_t v4;

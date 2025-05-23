@@ -22,7 +22,28 @@ You need a modern eBPF-enabled Linux distribution.
 
 On Ubuntu 16.04/18.04/20.04 Server LTS you can install the prerequisites (we assume that the compiler is already installed) as follows:
 ```sh
-$ sudo apt-get install build-essential autoconf automake autogen libjson-c-dev pkg-config libzmq3-dev libcurl4-openssl-dev libbpfcc-dev
+yum install build-essential autoconf automake autogen libjson-c-dev pkg-config libzmq3-dev libcurl4-openssl-dev libbpfcc-dev
+
+yum groupinstall "Development Tools" -y
+
+yum install json-c-devel -y
+
+yum install epel-release -y
+
+yum install libcurl-devel -y
+
+yum install gcc gcc-c++ make -y
+
+yum install https://repo.ius.io/ius-release-el7.rpm
+
+yum install bcc-devel bcc-tools -y
+
+yum install zeromq -y
+
+yum install -y zeromq-devel
+
+ln -s /usr/src/kernels/3.10.0-1160.119.1.el7.x86_64 /lib/modules/$(uname -r)/build
+
 ```
 
 ### Build

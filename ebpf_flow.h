@@ -48,6 +48,7 @@ typedef enum {
   ebpf_out_of_memory,
   ebpf_kprobe_attach_error,
   ebpf_events_open_error,
+  ebpf_rc_attach_kprobe
 } ebpfRetCode;
 
 /*

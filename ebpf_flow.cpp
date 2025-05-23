@@ -93,6 +93,8 @@ static int attachEBPFTracepoint(ebpf::BPF *bpf,
     printf("ERROR: %s/%s: %d/%s\n", tracepoint, probe_func, rc.code(), rc.msg().c_str());
 #endif
 
+  printf("Attach %s to %s %s\n", tracepoint, probe_func, rc.code() == 0 ? "OK" : "FAIL");
+
   return(rc.code());
 }
 
@@ -111,6 +113,8 @@ static int attachEBPFKernelProbe(ebpf::BPF *bpf, const char *queue_name,
   if(rc != 0)
     printf("ERROR: %s/%s: %d\n", queue_name, entry_point, rc);
 #endif
+
+  printf("Attach %s to %s %s\n", queue_name, entry_point, rc == 0 ? "OK" : "FAIL");
 
   return(rc);
 }
@@ -154,6 +158,8 @@ extern "C" {
 				  "trace_connect_entry", BPF_PROBE_ENTRY)
 	 || attachEBPFKernelProbe(bpf, "tcp_v6_connect",
 				  "trace_connect_v6_return", BPF_PROBE_RETURN)
+         || attachEBPFKernelProbe(bpf, "tcp_sendmsg",
+                                 "trace_tcp_sendmsg", BPF_PROBE_ENTRY)
 	 ) {
 	*rc = ebpf_kprobe_attach_error;
 	goto init_failed;
@@ -162,7 +168,12 @@ extern "C" {
 
     if((flags & LIBEBPF_TCP) && (flags & LIBEBPF_INCOMING)) {
       if(attachEBPFKernelProbe(bpf, "inet_csk_accept",
-			       "trace_tcp_accept", BPF_PROBE_RETURN)) {
+			       "trace_tcp_accept", BPF_PROBE_RETURN)
+         || attachEBPFKernelProbe(bpf, "tcp_cleanup_rbuf",
+                                 "trace_tcp_cleanup_rbuf", BPF_PROBE_ENTRY)
+         || attachEBPFKernelProbe(bpf, "tcp_recvmsg",
+                                 "trace_tcp_recvmsg", BPF_PROBE_ENTRY)
+	 ) {
 	*rc = ebpf_kprobe_attach_error;
 	goto init_failed;
       }
@@ -382,6 +393,9 @@ extern "C" {
 
     case ebpf_events_open_error:
       return("ebpf_events_open_error");
+
+    case ebpf_rc_attach_kprobe:
+      return("ebpf_rc_attach_kprobe");
     }
 
     return("Unknown error");

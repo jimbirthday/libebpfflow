@@ -176,8 +176,24 @@ static int fill_event(struct pt_regs *ctx, eBPFevent *ev,
   u32 pid    = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
   u32 saddr  = 0, daddr = 0;
   ktime_t kt = { bpf_ktime_get_ns() };
+  u32 len = 0;
 
   ev->sent_packet = (swap_peers == 0) ? 1 : 0;
+
+  // Get packet length from sk_buff
+  struct sk_buff *skb;
+  if(ev->sent_packet) {
+    // For outgoing packets, check write queue
+    bpf_probe_read(&skb, sizeof(skb), &sk->sk_write_queue.next);
+  } else {
+    // For incoming packets, check receive queue
+    bpf_probe_read(&skb, sizeof(skb), &sk->sk_receive_queue.next);
+  }
+  
+  if(skb) {
+    bpf_probe_read(&len, sizeof(len), &skb->len);
+    ev->len = len;
+  }
 
   bpf_probe_read(&family, sizeof(family), &sk->__sk_common.skc_family);
   if((family != AF_INET) && (family != AF_INET6)) return(-1);
@@ -339,6 +355,15 @@ int trace_tcp_retransmit_skb(struct pt_regs *ctx, struct sock *sk) {
   u32 tid = (bpf_get_current_pid_tgid() >> 32) & 0xFFFFFFFF;
   eBPFevent event = { .etype = eTCP_RETR, .retransmissions = 1 };
   
+  // Get packet length from sk_buff
+  struct sk_buff *skb;
+  bpf_probe_read(&skb, sizeof(skb), &sk->sk_receive_queue.next);
+  if(skb) {
+    u32 len;
+    bpf_probe_read(&len, sizeof(len), &skb->len);
+    event.len = len;
+  }
+  
   fill_event(ctx, &event, sk, NULL, 0, IPPROTO_TCP, 0);  
   ebpf_events.perf_submit(ctx, &event, sizeof(eBPFevent));
 
@@ -423,11 +448,14 @@ static inline int udp_packet_trace(void *ctx, struct sk_buff* skb, u_int8_t sent
   struct udphdr *udphdr;
   u16 eth_proto;
   struct net_device *dev;
+  u32 len;
 
   member_read(&head,       skb, head);
   member_read(&mac_header, skb, mac_header);
+  member_read(&len,        skb, len);
 
   head = head + mac_header;
+  event.len = len; // Set packet length
 
   bpf_probe_read(&eth_proto, sizeof(u16), &head[12]);
 
@@ -582,4 +610,30 @@ int trace_receive_v4(struct pt_regs *ctx, struct sock *sk) {
     ebpf_events.perf_submit(ctx, &event, sizeof(eBPFevent));
 
   return(0);
+}
+
+int trace_tcp_sendmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t size) {
+    eBPFevent event = { .etype = eTCP_SEND, .ip_version = 4 };
+    fill_event(ctx, &event, sk, NULL, 0, IPPROTO_TCP, 0);
+    event.len = size;
+    ebpf_events.perf_submit(ctx, &event, sizeof(eBPFevent));
+    return 0;
+}
+
+int trace_tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied) {
+    if (copied <= 0) return 0;
+    eBPFevent event = { .etype = eTCP_RECV, .ip_version = 4 };
+    fill_event(ctx, &event, sk, NULL, 0, IPPROTO_TCP, 1);
+    event.len = copied;
+    ebpf_events.perf_submit(ctx, &event, sizeof(eBPFevent));
+    return 0;
+}
+
+int trace_tcp_recvmsg(struct pt_regs *ctx, struct sock *sk, struct msghdr *msg, size_t len, int nonblock, int flags, int *addr_len) {
+    if (len <= 0) return 0;
+    eBPFevent event = { .etype = eTCP_RECV, .ip_version = 4 };
+    fill_event(ctx, &event, sk, NULL, 0, IPPROTO_TCP, 1);
+    event.len = len;
+    ebpf_events.perf_submit(ctx, &event, sizeof(eBPFevent));
+    return 0;
 }
