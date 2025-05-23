@@ -80,9 +80,16 @@ type IntervalStats struct {
 
 // 流量统计文件结构
 type TrafficStatsFile struct {
-	Date         string                   `json:"date"`
-	TotalStats   *NetworkEventStats       `json:"total_stats"`
-	ProcessStats map[string]*ProcessStats `json:"process_stats"`
+	Date      string `json:"date"`
+	Timestamp string `json:"timestamp"`
+	Period    struct {
+		StartTime string `json:"start_time"`
+		EndTime   string `json:"end_time"`
+	} `json:"period"`
+	TotalStats           *NetworkEventStats       `json:"total_stats"`
+	IntervalStats        *NetworkEventStats       `json:"interval_stats"`
+	ProcessStats         map[string]*ProcessStats `json:"process_stats"`
+	ProcessIntervalStats map[string]*ProcessStats `json:"process_interval_stats"`
 }
 
 // 文件存储管理器
@@ -415,10 +422,21 @@ func (tt *TrafficTracker) printStats() {
 	tt.cleanupInactiveConnections()
 
 	// 准备写入文件的数据
+	now := time.Now()
 	stats := &TrafficStatsFile{
-		Date:         time.Now().Format("2006-01-02"),
-		TotalStats:   tt.networkStats,
-		ProcessStats: tt.processStats,
+		Date:      now.Format("2006-01-02"),
+		Timestamp: now.Format(time.RFC3339),
+		Period: struct {
+			StartTime string `json:"start_time"`
+			EndTime   string `json:"end_time"`
+		}{
+			StartTime: tt.intervalStats.StartTime.Format(time.RFC3339),
+			EndTime:   now.Format(time.RFC3339),
+		},
+		TotalStats:           tt.networkStats,
+		IntervalStats:        tt.intervalStats.NetworkStats,
+		ProcessStats:         tt.processStats,
+		ProcessIntervalStats: tt.intervalStats.ProcessStats,
 	}
 
 	// 异步写入文件
