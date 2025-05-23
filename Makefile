@@ -41,8 +41,8 @@ ebpflow.ebpf.enc: ebpflow_header.ebpf ebpf_types.h ebpflow_code.ebpf Makefile
 	cat ebpflow_header.ebpf ebpf_types.h ebpflow_code.ebpf | base64 -w 0  >> ebpflow.ebpf.enc
 	echo ")\";" >> ebpflow.ebpf.enc
 
-go_ebpflowexport: ebpflowexport.go Makefile libebpfflow.a
+go: ebpflowexport.go Makefile libebpfflow.a
 	go build -o go_ebpflowexport ebpflowexport.go
 
 clean:
-	/bin/rm -f *~ container_info.a libebpfflow.a *.o ebpflow.ebpf.enc go_ebpflowexport
+	/bin/rm -f *~ container_info.a libebpfflow.a *.o ebpflow.ebpf.enc go_ebpflowexport ebpflowexport
