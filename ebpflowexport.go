@@ -15,6 +15,7 @@ import (
 )
 
 var gRUNNING bool = true
+var gLogLevel int = 0 // 0: no logs, 1: errors only, 2: info, 3: debug
 
 // 连接信息结构
 type ConnectionInfo struct {
@@ -298,11 +299,11 @@ func (tt *TrafficTracker) cleanupInactiveConnections() {
 }
 
 func (tt *TrafficTracker) printStats() {
+	// 先清理不活跃的连接
+	tt.cleanupInactiveConnections()
+
 	tt.mu.RLock()
 	defer tt.mu.RUnlock()
-
-	// 清理不活跃的连接
-	tt.cleanupInactiveConnections()
 
 	fmt.Printf("\n==========================================\n")
 	fmt.Printf("=== TRAFFIC STATISTICS ===\n")
@@ -501,6 +502,11 @@ func main() {
 	// 创建流量跟踪器
 	trafficTracker := NewTrafficTracker()
 
+	// 事件处理函数
+	eventHandler := func(event ebpf_flow.EBPFevent) {
+		trafficTracker.updateStats(event)
+	}
+
 	// 创建定时器，定期打印统计信息
 	ticker := time.NewTicker(10 * time.Second)
 	go func() {
@@ -509,18 +515,11 @@ func main() {
 		}
 	}()
 
-	// 事件处理函数
-	eventHandler := func(event ebpf_flow.EBPFevent) {
-		trafficTracker.updateStats(event)
-	}
-
 	// 初始化 ebpflow
 	ebpf := ebpf_flow.NewEbpflow(eventHandler, 0)
-	if ebpf == nil {
-		fmt.Println("Error initializing ebpflow")
-		return
+	if gLogLevel > 1 {
+		fmt.Println("Initialized")
 	}
-	fmt.Println("Initialized")
 
 	// 处理中断信号
 	c := make(chan os.Signal)
@@ -528,12 +527,10 @@ func main() {
 	go func() {
 		<-c
 		gRUNNING = false
-		// 打印最终统计信息
-		trafficTracker.printStats()
 	}()
 
 	// 轮询事件
-	for gRUNNING {
+	for gRUNNING == true {
 		ebpf.PollEvent(10)
 	}
 
