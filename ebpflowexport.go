@@ -298,163 +298,123 @@ func (tt *TrafficTracker) cleanupInactiveConnections() {
 	}
 }
 
+func (tt *TrafficTracker) writeStatsToFile(filename string, content string) error {
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open file %s: %v", filename, err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(content); err != nil {
+		return fmt.Errorf("failed to write to file %s: %v", filename, err)
+	}
+	return nil
+}
+
+func (tt *TrafficTracker) formatStatsForFile() (string, string) {
+	tt.mu.RLock()
+	defer tt.mu.RUnlock()
+
+	var cumulativeContent, intervalContent strings.Builder
+	now := time.Now()
+
+	// Format interval stats (only network traffic for current interval)
+	intervalContent.WriteString(fmt.Sprintf("\n==========================================\n"))
+	intervalContent.WriteString(fmt.Sprintf("INTERVAL NETWORK TRAFFIC STATISTICS\n"))
+	intervalContent.WriteString(fmt.Sprintf("Period: %v - %v\n",
+		tt.intervalStats.StartTime.Format(time.RFC3339),
+		now.Format(time.RFC3339)))
+	intervalContent.WriteString("==========================================\n\n")
+
+	// Overall network stats for current interval
+	if tt.intervalStats.NetworkStats != nil {
+		intervalContent.WriteString("NETWORK STATISTICS\n")
+		intervalContent.WriteString("-----------------\n")
+		intervalContent.WriteString("TCP Traffic:\n")
+		intervalContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.TCPStats.SendBytes, tt.intervalStats.NetworkStats.TCPStats.SendPkts))
+		intervalContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.TCPStats.RecvBytes, tt.intervalStats.NetworkStats.TCPStats.RecvPkts))
+		intervalContent.WriteString("UDP Traffic:\n")
+		intervalContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.UDPStats.SendBytes, tt.intervalStats.NetworkStats.UDPStats.SendPkts))
+		intervalContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.UDPStats.RecvBytes, tt.intervalStats.NetworkStats.UDPStats.RecvPkts))
+	}
+
+	// Format cumulative stats (all historical data)
+	cumulativeContent.WriteString(fmt.Sprintf("\n==========================================\n"))
+	cumulativeContent.WriteString(fmt.Sprintf("CUMULATIVE TRAFFIC STATISTICS\n"))
+	cumulativeContent.WriteString(fmt.Sprintf("Generated at: %v\n", now.Format(time.RFC3339)))
+	cumulativeContent.WriteString("==========================================\n\n")
+
+	// Overall network stats (all time)
+	if tt.networkStats != nil {
+		cumulativeContent.WriteString("NETWORK STATISTICS\n")
+		cumulativeContent.WriteString("-----------------\n")
+		cumulativeContent.WriteString("TCP Traffic:\n")
+		cumulativeContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.networkStats.TCPStats.SendBytes, tt.networkStats.TCPStats.SendPkts))
+		cumulativeContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.networkStats.TCPStats.RecvBytes, tt.networkStats.TCPStats.RecvPkts))
+		cumulativeContent.WriteString("UDP Traffic:\n")
+		cumulativeContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.networkStats.UDPStats.SendBytes, tt.networkStats.UDPStats.SendPkts))
+		cumulativeContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n\n", tt.networkStats.UDPStats.RecvBytes, tt.networkStats.UDPStats.RecvPkts))
+	}
+
+	// Process stats (all time)
+	cumulativeContent.WriteString("PROCESS STATISTICS\n")
+	cumulativeContent.WriteString("-----------------\n")
+	for processID, stats := range tt.processStats {
+		cumulativeContent.WriteString(fmt.Sprintf("\nProcess: %s\n", processID))
+		if stats.ProcessInfo.IsDocker {
+			cumulativeContent.WriteString("  Type: Docker Container\n")
+			cumulativeContent.WriteString(fmt.Sprintf("  Container ID: %s\n", stats.ProcessInfo.ContainerID))
+		} else {
+			cumulativeContent.WriteString("  Type: Host Process\n")
+		}
+		cumulativeContent.WriteString(fmt.Sprintf("  PID: %d\n", stats.ProcessInfo.PID))
+		cumulativeContent.WriteString(fmt.Sprintf("  Name: %s\n", stats.ProcessInfo.Name))
+		cumulativeContent.WriteString(fmt.Sprintf("  Running Time: %v\n", time.Since(stats.StartTime).Round(time.Second)))
+		cumulativeContent.WriteString("  Traffic:\n")
+		cumulativeContent.WriteString(fmt.Sprintf("    Inbound:  %d bytes (%d packets)\n", stats.TotalBytesIn, stats.TotalPktsIn))
+		cumulativeContent.WriteString(fmt.Sprintf("    Outbound: %d bytes (%d packets)\n", stats.TotalBytesOut, stats.TotalPktsOut))
+
+		// All active connections
+		if len(stats.Connections) > 0 {
+			cumulativeContent.WriteString("  Active Connections:\n")
+			for _, conn := range stats.Connections {
+				if conn == nil {
+					continue
+				}
+				cumulativeContent.WriteString(fmt.Sprintf("    %s:%d -> %s:%d\n",
+					conn.SrcIP, conn.SrcPort, conn.DstIP, conn.DstPort))
+				cumulativeContent.WriteString(fmt.Sprintf("      Inbound:  %d bytes (%d packets)\n", conn.BytesIn, conn.PktsIn))
+				cumulativeContent.WriteString(fmt.Sprintf("      Outbound: %d bytes (%d packets)\n", conn.BytesOut, conn.PktsOut))
+				cumulativeContent.WriteString(fmt.Sprintf("      Last Seen: %s\n", conn.LastSeen.Format(time.RFC3339)))
+			}
+		}
+		cumulativeContent.WriteString("-----------------\n")
+	}
+
+	return cumulativeContent.String(), intervalContent.String()
+}
+
 func (tt *TrafficTracker) printStats() {
 	// 先清理不活跃的连接
 	tt.cleanupInactiveConnections()
 
-	tt.mu.RLock()
-	defer tt.mu.RUnlock()
+	// 格式化统计数据
+	cumulativeContent, intervalContent := tt.formatStatsForFile()
 
-	fmt.Printf("\n==========================================\n")
-	fmt.Printf("=== TRAFFIC STATISTICS ===\n")
-	fmt.Printf("=== Period: %v - %v ===\n",
-		tt.intervalStats.StartTime.Format(time.RFC3339),
-		time.Now().Format(time.RFC3339))
-	fmt.Printf("==========================================\n")
-
-	// 打印总体网络统计
-	if tt.networkStats != nil {
-		tt.printNetworkStats(tt.networkStats, tt.intervalStats.NetworkStats)
+	// 写入文件
+	if err := tt.writeStatsToFile("cumulative_stats.log", cumulativeContent); err != nil {
+		fmt.Printf("Error writing cumulative stats: %v\n", err)
+	}
+	if err := tt.writeStatsToFile("interval_stats.log", intervalContent); err != nil {
+		fmt.Printf("Error writing interval stats: %v\n", err)
 	}
 
-	// 打印进程统计
-	fmt.Printf("\n--- Process Traffic Statistics ---\n")
-
-	// 合并显示所有进程的统计信息
-	allProcesses := make(map[string]bool)
-	if tt.processStats != nil {
-		for k := range tt.processStats {
-			allProcesses[k] = true
-		}
-	}
-	if tt.intervalStats != nil && tt.intervalStats.ProcessStats != nil {
-		for k := range tt.intervalStats.ProcessStats {
-			allProcesses[k] = true
-		}
-	}
-
-	for processID := range allProcesses {
-		cumulativeStats := tt.processStats[processID]
-		var intervalStats, lastStats *ProcessStats
-		if tt.intervalStats != nil {
-			intervalStats = tt.intervalStats.ProcessStats[processID]
-			lastStats = tt.intervalStats.LastStats[processID]
-		}
-
-		fmt.Printf("\nProcess: %s\n", processID)
-		if cumulativeStats != nil {
-			if cumulativeStats.ProcessInfo.IsDocker {
-				fmt.Printf("  Type: Docker Container\n")
-				fmt.Printf("  Container ID: %s\n", cumulativeStats.ProcessInfo.ContainerID)
-			} else {
-				fmt.Printf("  Type: Host Process\n")
-			}
-			fmt.Printf("  PID: %d\n", cumulativeStats.ProcessInfo.PID)
-			fmt.Printf("  Name: %s\n", cumulativeStats.ProcessInfo.Name)
-			fmt.Printf("  Duration: %v\n", time.Since(cumulativeStats.StartTime))
-
-			// 累计统计
-			fmt.Printf("  Cumulative Traffic:\n")
-			fmt.Printf("    Bytes In:  %d (Packets: %d)\n", cumulativeStats.TotalBytesIn, cumulativeStats.TotalPktsIn)
-			fmt.Printf("    Bytes Out: %d (Packets: %d)\n", cumulativeStats.TotalBytesOut, cumulativeStats.TotalPktsOut)
-		}
-
-		// 间隔统计
-		if intervalStats != nil && lastStats != nil {
-			// 计算当前间隔的统计值
-			bytesInDiff := intervalStats.TotalBytesIn
-			bytesOutDiff := intervalStats.TotalBytesOut
-			pktsInDiff := intervalStats.TotalPktsIn
-			pktsOutDiff := intervalStats.TotalPktsOut
-
-			if bytesInDiff > 0 || bytesOutDiff > 0 || pktsInDiff > 0 || pktsOutDiff > 0 {
-				fmt.Printf("  Interval Traffic:\n")
-				fmt.Printf("    Bytes In:  %d (Packets: %d)\n", bytesInDiff, pktsInDiff)
-				fmt.Printf("    Bytes Out: %d (Packets: %d)\n", bytesOutDiff, pktsOutDiff)
-			}
-		}
-
-		// 显示活跃连接
-		if cumulativeStats != nil && len(cumulativeStats.Connections) > 0 {
-			fmt.Printf("\n  Active Connections:\n")
-			for _, conn := range cumulativeStats.Connections {
-				if conn == nil {
-					continue
-				}
-				fmt.Printf("    %s:%d -> %s:%d\n",
-					conn.SrcIP, conn.SrcPort, conn.DstIP, conn.DstPort)
-				fmt.Printf("      Total Bytes In:  %d (Packets: %d)\n", conn.BytesIn, conn.PktsIn)
-				fmt.Printf("      Total Bytes Out: %d (Packets: %d)\n", conn.BytesOut, conn.PktsOut)
-
-				// 显示连接的变化
-				if intervalStats != nil && lastStats != nil {
-					connKey := getConnectionKey(conn.SrcIP, conn.DstIP, conn.SrcPort, conn.DstPort)
-					if intervalConn, exists := intervalStats.Connections[connKey]; exists && intervalConn != nil {
-						if lastConn, exists := lastStats.Connections[connKey]; exists && lastConn != nil {
-							// 计算当前间隔的统计值
-							bytesInDiff := intervalConn.BytesIn
-							bytesOutDiff := intervalConn.BytesOut
-							pktsInDiff := intervalConn.PktsIn
-							pktsOutDiff := intervalConn.PktsOut
-
-							if bytesInDiff > 0 || bytesOutDiff > 0 || pktsInDiff > 0 || pktsOutDiff > 0 {
-								fmt.Printf("      Interval Bytes In:  %d (Packets: %d)\n", bytesInDiff, pktsInDiff)
-								fmt.Printf("      Interval Bytes Out: %d (Packets: %d)\n", bytesOutDiff, pktsOutDiff)
-							}
-						}
-					}
-				}
-				fmt.Printf("      Last Seen: %s\n", conn.LastSeen.Format(time.RFC3339))
-			}
-		}
-		fmt.Printf("----------------------------\n")
-	}
+	// 打印到控制台
+	fmt.Print(cumulativeContent)
+	fmt.Print(intervalContent)
 
 	// 重置间隔统计
 	tt.resetIntervalStats()
-}
-
-func (tt *TrafficTracker) printNetworkStats(cumulativeStats, intervalStats *NetworkEventStats) {
-	if cumulativeStats == nil {
-		return
-	}
-
-	fmt.Printf("\n--- Overall Network Event Statistics ---\n")
-
-	// 累计统计
-	fmt.Printf("Cumulative Statistics:\n")
-	fmt.Printf("TCP:\n")
-	fmt.Printf("  Send: %d bytes (%d packets)\n", cumulativeStats.TCPStats.SendBytes, cumulativeStats.TCPStats.SendPkts)
-	fmt.Printf("  Recv: %d bytes (%d packets)\n", cumulativeStats.TCPStats.RecvBytes, cumulativeStats.TCPStats.RecvPkts)
-	fmt.Printf("UDP:\n")
-	fmt.Printf("  Send: %d bytes (%d packets)\n", cumulativeStats.UDPStats.SendBytes, cumulativeStats.UDPStats.SendPkts)
-	fmt.Printf("  Recv: %d bytes (%d packets)\n", cumulativeStats.UDPStats.RecvBytes, cumulativeStats.UDPStats.RecvPkts)
-
-	// 间隔统计
-	if intervalStats != nil {
-		// 计算当前间隔的统计值
-		tcpSendDiff := intervalStats.TCPStats.SendBytes
-		tcpRecvDiff := intervalStats.TCPStats.RecvBytes
-		tcpSendPktsDiff := intervalStats.TCPStats.SendPkts
-		tcpRecvPktsDiff := intervalStats.TCPStats.RecvPkts
-
-		udpSendDiff := intervalStats.UDPStats.SendBytes
-		udpRecvDiff := intervalStats.UDPStats.RecvBytes
-		udpSendPktsDiff := intervalStats.UDPStats.SendPkts
-		udpRecvPktsDiff := intervalStats.UDPStats.RecvPkts
-
-		if tcpSendDiff > 0 || tcpRecvDiff > 0 || udpSendDiff > 0 || udpRecvDiff > 0 {
-			fmt.Printf("\nInterval Statistics:\n")
-			fmt.Printf("TCP:\n")
-			fmt.Printf("  Send: %d bytes (%d packets)\n", tcpSendDiff, tcpSendPktsDiff)
-			fmt.Printf("  Recv: %d bytes (%d packets)\n", tcpRecvDiff, tcpRecvPktsDiff)
-			fmt.Printf("UDP:\n")
-			fmt.Printf("  Send: %d bytes (%d packets)\n", udpSendDiff, udpSendPktsDiff)
-			fmt.Printf("  Recv: %d bytes (%d packets)\n", udpRecvDiff, udpRecvPktsDiff)
-		}
-	}
-
-	fmt.Printf("\nLast Updated: %s\n", cumulativeStats.LastSeen.Format(time.RFC3339))
 }
 
 func (tt *TrafficTracker) resetIntervalStats() {
