@@ -20,15 +20,20 @@ import (
 var gRUNNING bool = true
 var gLogLevel int = 0 // 0: no logs, 1: errors only, 2: info, 3: debug
 
-// 添加配置常量
+// 修改常量定义，增加更细粒度的控制
 const (
-	DefaultConnTimeout     = 30 * time.Second // 默认连接超时时间
-	DefaultCleanupInterval = 5 * time.Minute  // 默认清理间隔
-	MaxStoredProcesses     = 1000             // 最大存储进程数
-	MaxStoredConnections   = 5000             // 每个进程最大存储连接数
-	MaxStoredIntervals     = 24               // 最大存储间隔数
-	LogFilePrefix          = "ebpflow_"       // 日志文件前缀
-	LogFileSuffix          = ".log"           // 日志文件后缀
+	DefaultConnTimeout     = 30 * time.Second  // 默认连接超时时间
+	DefaultCleanupInterval = 1 * time.Minute   // 减少清理间隔到1分钟
+	MaxStoredProcesses     = 1000              // 最大存储进程数
+	MaxStoredConnections   = 5000              // 每个进程最大存储连接数
+	MaxStoredIntervals     = 12                // 减少存储的间隔数到12个（1小时）
+	LogFilePrefix          = "ebpflow_"        // 日志文件前缀
+	LogFileSuffix          = ".log"            // 日志文件后缀
+	MaxLogFileSize         = 100 * 1024 * 1024 // 最大日志文件大小（100MB）
+	LogBufferSize          = 32 * 1024         // 增加日志缓冲区大小到32KB
+	EventBufferSize        = 1024 * 1024       // 增加事件缓冲区大小到1MB
+	EventBatchSize         = 100               // 每次处理的事件批大小
+	EventProcessTimeout    = 50                // 事件处理超时时间(ms)
 )
 
 // 连接信息结构
@@ -100,6 +105,7 @@ type LogFileManager struct {
 	intervalFile   *os.File
 	mu             sync.Mutex
 	bufferSize     int
+	currentSize    int64
 }
 
 func NewLogFileManager(baseDir string) *LogFileManager {
@@ -193,6 +199,18 @@ func (lfm *LogFileManager) writeLog(logType string, content string) error {
 		file = lfm.intervalFile
 	}
 
+	// 检查文件大小
+	if lfm.currentSize > MaxLogFileSize {
+		if err := lfm.rotate(); err != nil {
+			return err
+		}
+		if logType == "cumulative" {
+			file = lfm.cumulativeFile
+		} else {
+			file = lfm.intervalFile
+		}
+	}
+
 	// 使用缓冲写入
 	writer := bufio.NewWriterSize(file, lfm.bufferSize)
 	if _, err := writer.WriteString(content); err != nil {
@@ -201,6 +219,9 @@ func (lfm *LogFileManager) writeLog(logType string, content string) error {
 	if err := writer.Flush(); err != nil {
 		return fmt.Errorf("failed to flush log file: %v", err)
 	}
+
+	// 更新文件大小
+	lfm.currentSize += int64(len(content))
 	return nil
 }
 
@@ -217,6 +238,29 @@ func (lfm *LogFileManager) close() {
 	}
 }
 
+// 添加事件统计结构
+type EventStats struct {
+	TotalEvents     uint64
+	LostEvents      uint64
+	ProcessedEvents uint64
+	LastReport      time.Time
+	mu              sync.Mutex
+}
+
+func (es *EventStats) Update(total, lost uint64) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	es.TotalEvents = total
+	es.LostEvents = lost
+	es.ProcessedEvents = total - lost
+}
+
+func (es *EventStats) GetStats() (uint64, uint64, uint64) {
+	es.mu.Lock()
+	defer es.mu.Unlock()
+	return es.TotalEvents, es.LostEvents, es.ProcessedEvents
+}
+
 type TrafficTracker struct {
 	processStats  map[string]*ProcessStats
 	networkStats  *NetworkEventStats
@@ -225,32 +269,49 @@ type TrafficTracker struct {
 	connTimeout   time.Duration
 	cleanupTicker *time.Ticker
 	stopCleanup   chan struct{}
-	intervals     []*IntervalStats // 存储历史间隔数据
+	intervals     []*IntervalStats
 	logManager    *LogFileManager
+	lastCleanup   time.Time
+	memStats      struct {
+		totalConnections int
+		totalProcesses   int
+		lastReport       time.Time
+	}
+	eventStats *EventStats
+	eventChan  chan ebpf_flow.EBPFevent
+	eventStop  chan struct{}
+	eventWg    sync.WaitGroup
 }
 
 func NewTrafficTracker() *TrafficTracker {
 	tt := &TrafficTracker{
-		processStats: make(map[string]*ProcessStats),
+		processStats: make(map[string]*ProcessStats, MaxStoredProcesses),
 		networkStats: &NetworkEventStats{},
 		intervalStats: &IntervalStats{
-			ProcessStats: make(map[string]*ProcessStats),
+			ProcessStats: make(map[string]*ProcessStats, MaxStoredProcesses),
 			NetworkStats: &NetworkEventStats{},
 			StartTime:    time.Now(),
-			LastStats:    make(map[string]*ProcessStats),
+			LastStats:    make(map[string]*ProcessStats, MaxStoredProcesses),
 		},
 		connTimeout: DefaultConnTimeout,
 		stopCleanup: make(chan struct{}),
 		intervals:   make([]*IntervalStats, 0, MaxStoredIntervals),
-		logManager:  NewLogFileManager("logs"), // 创建日志管理器
+		logManager:  NewLogFileManager("logs"),
+		lastCleanup: time.Now(),
+		eventStats: &EventStats{
+			LastReport: time.Now(),
+		},
+		eventChan: make(chan ebpf_flow.EBPFevent, EventBufferSize),
+		eventStop: make(chan struct{}),
 	}
 
-	// 初始化日志文件
 	if err := tt.logManager.rotate(); err != nil {
 		fmt.Printf("Error initializing log files: %v\n", err)
 	}
 
 	tt.startCleanupRoutine()
+	tt.startEventProcessor()
+
 	return tt
 }
 
@@ -270,33 +331,78 @@ func (tt *TrafficTracker) startCleanupRoutine() {
 	}()
 }
 
+// 启动事件处理协程
+func (tt *TrafficTracker) startEventProcessor() {
+	tt.eventWg.Add(1)
+	go func() {
+		defer tt.eventWg.Done()
+		batch := make([]ebpf_flow.EBPFevent, 0, EventBatchSize)
+		ticker := time.NewTicker(time.Millisecond * 100)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-tt.eventStop:
+				// 处理剩余的事件
+				if len(batch) > 0 {
+					tt.processEventBatch(batch)
+				}
+				return
+			case event := <-tt.eventChan:
+				batch = append(batch, event)
+				if len(batch) >= EventBatchSize {
+					tt.processEventBatch(batch)
+					batch = batch[:0]
+				}
+			case <-ticker.C:
+				if len(batch) > 0 {
+					tt.processEventBatch(batch)
+					batch = batch[:0]
+				}
+			}
+		}
+	}()
+}
+
 // 清理过期和不必要的数据
 func (tt *TrafficTracker) cleanup() {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 
 	now := time.Now()
+	if now.Sub(tt.lastCleanup) < DefaultCleanupInterval {
+		return // 避免过于频繁的清理
+	}
+
+	// 清理过期连接和进程
+	activeConnections := 0
+	activeProcesses := 0
 
 	// 1. 清理过期连接
-	for _, stats := range tt.processStats {
+	for pid, stats := range tt.processStats {
 		// 清理过期连接
 		for connKey, conn := range stats.Connections {
 			if now.Sub(conn.LastSeen) > tt.connTimeout {
 				delete(stats.Connections, connKey)
+				continue
 			}
+			activeConnections++
 		}
 
 		// 如果连接数超过限制，删除最旧的连接
 		if len(stats.Connections) > MaxStoredConnections {
-			// 按最后访问时间排序
-			type connWithTime struct {
+			conns := make([]struct {
 				key string
 				t   time.Time
-			}
-			conns := make([]connWithTime, 0, len(stats.Connections))
+			}, 0, len(stats.Connections))
+
 			for k, v := range stats.Connections {
-				conns = append(conns, connWithTime{k, v.LastSeen})
+				conns = append(conns, struct {
+					key string
+					t   time.Time
+				}{k, v.LastSeen})
 			}
+
 			sort.Slice(conns, func(i, j int) bool {
 				return conns[i].t.Before(conns[j].t)
 			})
@@ -305,33 +411,44 @@ func (tt *TrafficTracker) cleanup() {
 			for i := 0; i < len(conns)-MaxStoredConnections; i++ {
 				delete(stats.Connections, conns[i].key)
 			}
+			activeConnections = len(stats.Connections)
 		}
+
+		// 如果进程没有活跃连接，考虑删除
+		if len(stats.Connections) == 0 && now.Sub(stats.LastSeen) > tt.connTimeout*2 {
+			delete(tt.processStats, pid)
+			continue
+		}
+		activeProcesses++
 	}
 
-	// 2. 清理过期进程
-	if len(tt.processStats) > MaxStoredProcesses {
-		// 按最后访问时间排序
-		type procWithTime struct {
-			key string
-			t   time.Time
-		}
-		procs := make([]procWithTime, 0, len(tt.processStats))
-		for k, v := range tt.processStats {
-			procs = append(procs, procWithTime{k, v.LastSeen})
-		}
-		sort.Slice(procs, func(i, j int) bool {
-			return procs[i].t.Before(procs[j].t)
-		})
-
-		// 删除最旧的进程直到数量在限制内
-		for i := 0; i < len(procs)-MaxStoredProcesses; i++ {
-			delete(tt.processStats, procs[i].key)
-		}
-	}
-
-	// 3. 清理历史间隔数据
+	// 2. 清理历史间隔数据
 	if len(tt.intervals) > MaxStoredIntervals {
+		// 只保留最近的间隔数据
 		tt.intervals = tt.intervals[len(tt.intervals)-MaxStoredIntervals:]
+
+		// 清理每个间隔中的不活跃连接
+		for _, interval := range tt.intervals {
+			for _, stats := range interval.ProcessStats {
+				for connKey, conn := range stats.Connections {
+					if now.Sub(conn.LastSeen) > tt.connTimeout {
+						delete(stats.Connections, connKey)
+					}
+				}
+			}
+		}
+	}
+
+	// 更新内存统计
+	tt.memStats.totalConnections = activeConnections
+	tt.memStats.totalProcesses = activeProcesses
+	tt.memStats.lastReport = now
+	tt.lastCleanup = now
+
+	// 如果距离上次报告超过1小时，输出内存使用情况
+	if now.Sub(tt.memStats.lastReport) > time.Hour {
+		fmt.Printf("Memory stats - Active connections: %d, Active processes: %d\n",
+			tt.memStats.totalConnections, tt.memStats.totalProcesses)
 	}
 }
 
@@ -510,6 +627,18 @@ func (tt *TrafficTracker) updateStats(event ebpf_flow.EBPFevent) {
 	tt.intervalStats.NetworkStats.LastSeen = time.Now()
 }
 
+func (tt *TrafficTracker) processEventBatch(events []ebpf_flow.EBPFevent) {
+	for _, event := range events {
+		tt.updateStats(event)
+	}
+}
+
+func (tt *TrafficTracker) Stop() {
+	close(tt.eventStop)
+	tt.eventWg.Wait()
+	close(tt.eventChan)
+}
+
 func (tt *TrafficTracker) writeStatsToFile(logType string, content string) error {
 	return tt.logManager.writeLog(logType, content)
 }
@@ -677,50 +806,43 @@ func (tt *TrafficTracker) resetIntervalStats() {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 
-	// 保存当前间隔到历史记录
-	tt.intervals = append(tt.intervals, tt.intervalStats)
+	now := time.Now()
+
+	// 保存当前间隔到历史记录，但只保存必要的统计信息
+	currentInterval := &IntervalStats{
+		ProcessStats: make(map[string]*ProcessStats),
+		NetworkStats: tt.intervalStats.NetworkStats,
+		StartTime:    tt.intervalStats.StartTime,
+		EndTime:      now,
+	}
+
+	// 只复制活跃的进程统计
+	for pid, stats := range tt.intervalStats.ProcessStats {
+		if now.Sub(stats.LastSeen) <= tt.connTimeout {
+			currentInterval.ProcessStats[pid] = &ProcessStats{
+				TotalBytesIn:  stats.TotalBytesIn,
+				TotalBytesOut: stats.TotalBytesOut,
+				TotalPktsIn:   stats.TotalPktsIn,
+				TotalPktsOut:  stats.TotalPktsOut,
+				LastSeen:      stats.LastSeen,
+				StartTime:     stats.StartTime,
+				ProcessInfo:   stats.ProcessInfo,
+				// 不复制连接信息，减少内存使用
+			}
+		}
+	}
+
+	tt.intervals = append(tt.intervals, currentInterval)
 	if len(tt.intervals) > MaxStoredIntervals {
 		tt.intervals = tt.intervals[1:]
 	}
 
-	// 创建新的间隔统计
-	lastStats := make(map[string]*ProcessStats)
-	for k, v := range tt.intervalStats.ProcessStats {
-		lastStat := &ProcessStats{
-			TotalBytesIn:  v.TotalBytesIn,
-			TotalBytesOut: v.TotalBytesOut,
-			TotalPktsIn:   v.TotalPktsIn,
-			TotalPktsOut:  v.TotalPktsOut,
-			LastSeen:      v.LastSeen,
-			StartTime:     v.StartTime,
-			Connections:   make(map[string]*ConnectionInfo),
-			ProcessInfo:   v.ProcessInfo,
-		}
-
-		// 只复制活跃的连接
-		for connKey, conn := range v.Connections {
-			if time.Since(conn.LastSeen) <= tt.connTimeout {
-				lastStat.Connections[connKey] = &ConnectionInfo{
-					SrcIP:    conn.SrcIP,
-					DstIP:    conn.DstIP,
-					SrcPort:  conn.SrcPort,
-					DstPort:  conn.DstPort,
-					BytesIn:  conn.BytesIn,
-					BytesOut: conn.BytesOut,
-					PktsIn:   conn.PktsIn,
-					PktsOut:  conn.PktsOut,
-					LastSeen: conn.LastSeen,
-				}
-			}
-		}
-		lastStats[k] = lastStat
-	}
-
+	// 创建新的间隔统计，重用现有的 map
 	tt.intervalStats = &IntervalStats{
-		ProcessStats: make(map[string]*ProcessStats),
+		ProcessStats: make(map[string]*ProcessStats, MaxStoredProcesses),
 		NetworkStats: &NetworkEventStats{},
-		StartTime:    time.Now(),
-		LastStats:    lastStats,
+		StartTime:    now,
+		LastStats:    make(map[string]*ProcessStats, MaxStoredProcesses),
 	}
 }
 
@@ -729,7 +851,15 @@ func main() {
 
 	// 事件处理函数
 	eventHandler := func(event ebpf_flow.EBPFevent) {
-		trafficTracker.updateStats(event)
+		select {
+		case trafficTracker.eventChan <- event:
+			// 事件成功入队
+		default:
+			// 通道已满，记录丢失的事件
+			if gLogLevel > 0 {
+				fmt.Printf("Event channel full, event dropped\n")
+			}
+		}
 	}
 
 	// 创建定时器，定期打印统计信息
@@ -741,11 +871,20 @@ func main() {
 	// 先等待到下一个5秒整点
 	time.Sleep(initialDelay)
 
+	// 创建一个done通道用于优雅关闭
+	done := make(chan struct{})
+
 	// 然后开始5秒间隔的计时
 	ticker := time.NewTicker(5 * time.Second)
 	go func() {
-		for range ticker.C {
-			trafficTracker.printStats()
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				trafficTracker.printStats()
+			case <-done:
+				return
+			}
 		}
 	}()
 
@@ -756,24 +895,89 @@ func main() {
 	}
 
 	// 处理中断信号
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// 创建一个关闭通道
+	shutdown := make(chan struct{})
+
+	// 信号处理协程
 	go func() {
-		<-c
+		sig := <-sigChan
+		fmt.Printf("\nReceived signal: %v\n", sig)
 		gRUNNING = false
+
+		// 通知所有组件开始关闭
+		close(shutdown)
+
+		// 等待一小段时间确保最后的统计被写入
+		time.Sleep(2 * time.Second)
+
 		// 停止清理协程
 		close(trafficTracker.stopCleanup)
-		// 最后一次清理
+
+		// 最后一次清理和统计
 		trafficTracker.cleanup()
+		trafficTracker.printStats()
+
 		// 关闭日志文件
 		trafficTracker.logManager.close()
+
+		// 通知主循环可以退出了
+		close(done)
 	}()
 
-	// 轮询事件
-	for gRUNNING == true {
-		ebpf.PollEvent(10)
+	// 在信号处理协程中添加事件统计报告
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				total, lost, processed := trafficTracker.eventStats.GetStats()
+				if lost > 0 {
+					lossRate := float64(lost) / float64(total) * 100
+					fmt.Printf("Event Statistics:\n"+
+						"  Total Events: %d\n"+
+						"  Processed Events: %d\n"+
+						"  Lost Events: %d (%.2f%%)\n",
+						total, processed, lost, lossRate)
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	// 主事件循环
+	fmt.Println("Starting event polling...")
+	for gRUNNING {
+		select {
+		case <-shutdown:
+			// 收到关闭信号，退出循环
+			gRUNNING = false
+		default:
+			// 轮询事件，但使用较短的超时时间
+			ebpf.PollEvent(100) // 使用100ms超时，这样能更快响应关闭信号
+		}
 	}
+
+	fmt.Println("Cleaning up resources...")
 
 	// 清理资源
 	ebpf.Close()
+
+	// 等待所有组件完成清理
+	<-done
+	fmt.Println("Cleanup completed, exiting.")
+
+	// 在清理资源时添加事件统计报告
+	fmt.Println("Final Event Statistics:")
+	total, lost, processed := trafficTracker.eventStats.GetStats()
+	lossRate := float64(lost) / float64(total) * 100
+	fmt.Printf("  Total Events: %d\n"+
+		"  Processed Events: %d\n"+
+		"  Lost Events: %d (%.2f%%)\n",
+		total, processed, lost, lossRate)
 }
