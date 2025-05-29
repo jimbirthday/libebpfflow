@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"net"
 	"os"
@@ -98,6 +99,7 @@ type LogFileManager struct {
 	cumulativeFile *os.File
 	intervalFile   *os.File
 	mu             sync.Mutex
+	bufferSize     int
 }
 
 func NewLogFileManager(baseDir string) *LogFileManager {
@@ -110,6 +112,7 @@ func NewLogFileManager(baseDir string) *LogFileManager {
 		baseDir:     baseDir,
 		currentHour: time.Now().Hour(),
 		currentDate: time.Now().Format("2006-01-02"),
+		bufferSize:  8192, // 8KB 缓冲区
 	}
 }
 
@@ -190,8 +193,13 @@ func (lfm *LogFileManager) writeLog(logType string, content string) error {
 		file = lfm.intervalFile
 	}
 
-	if _, err := file.WriteString(content); err != nil {
+	// 使用缓冲写入
+	writer := bufio.NewWriterSize(file, lfm.bufferSize)
+	if _, err := writer.WriteString(content); err != nil {
 		return fmt.Errorf("failed to write to log file: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush log file: %v", err)
 	}
 	return nil
 }
@@ -506,107 +514,160 @@ func (tt *TrafficTracker) writeStatsToFile(logType string, content string) error
 	return tt.logManager.writeLog(logType, content)
 }
 
-func (tt *TrafficTracker) formatStatsForFile() (string, string) {
+func (tt *TrafficTracker) formatStatsForFile() error {
 	tt.mu.RLock()
 	defer tt.mu.RUnlock()
 
-	var cumulativeContent, intervalContent strings.Builder
 	now := time.Now()
 
-	// Format interval stats (only network traffic for current interval)
-	intervalContent.WriteString(fmt.Sprintf("\n==========================================\n"))
-	intervalContent.WriteString(fmt.Sprintf("INTERVAL NETWORK TRAFFIC STATISTICS\n"))
-	intervalContent.WriteString(fmt.Sprintf("Period: %v - %v\n",
+	// 写入间隔统计
+	intervalContent := fmt.Sprintf("\n==========================================\n"+
+		"INTERVAL NETWORK TRAFFIC STATISTICS\n"+
+		"Period: %v - %v\n"+
+		"==========================================\n\n",
 		tt.intervalStats.StartTime.Format(time.RFC3339),
-		now.Format(time.RFC3339)))
-	intervalContent.WriteString("==========================================\n\n")
+		now.Format(time.RFC3339))
 
-	// Overall network stats for current interval
+	if err := tt.writeStatsToFile("interval", intervalContent); err != nil {
+		return err
+	}
+
+	// 写入网络统计
 	if tt.intervalStats.NetworkStats != nil {
-		intervalContent.WriteString("NETWORK STATISTICS\n")
-		intervalContent.WriteString("-----------------\n")
-		intervalContent.WriteString("TCP Traffic:\n")
-		intervalContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.TCPStats.SendBytes, tt.intervalStats.NetworkStats.TCPStats.SendPkts))
-		intervalContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.TCPStats.RecvBytes, tt.intervalStats.NetworkStats.TCPStats.RecvPkts))
-		intervalContent.WriteString("UDP Traffic:\n")
-		intervalContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.UDPStats.SendBytes, tt.intervalStats.NetworkStats.UDPStats.SendPkts))
-		intervalContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.intervalStats.NetworkStats.UDPStats.RecvBytes, tt.intervalStats.NetworkStats.UDPStats.RecvPkts))
-	}
+		networkStats := fmt.Sprintf("NETWORK STATISTICS\n"+
+			"-----------------\n"+
+			"TCP Traffic:\n"+
+			"  Outbound: %d bytes (%d packets)\n"+
+			"  Inbound:  %d bytes (%d packets)\n"+
+			"UDP Traffic:\n"+
+			"  Outbound: %d bytes (%d packets)\n"+
+			"  Inbound:  %d bytes (%d packets)\n",
+			tt.intervalStats.NetworkStats.TCPStats.SendBytes,
+			tt.intervalStats.NetworkStats.TCPStats.SendPkts,
+			tt.intervalStats.NetworkStats.TCPStats.RecvBytes,
+			tt.intervalStats.NetworkStats.TCPStats.RecvPkts,
+			tt.intervalStats.NetworkStats.UDPStats.SendBytes,
+			tt.intervalStats.NetworkStats.UDPStats.SendPkts,
+			tt.intervalStats.NetworkStats.UDPStats.RecvBytes,
+			tt.intervalStats.NetworkStats.UDPStats.RecvPkts)
 
-	// Format cumulative stats (all historical data)
-	cumulativeContent.WriteString(fmt.Sprintf("\n==========================================\n"))
-	cumulativeContent.WriteString(fmt.Sprintf("CUMULATIVE TRAFFIC STATISTICS\n"))
-	cumulativeContent.WriteString(fmt.Sprintf("Generated at: %v\n", now.Format(time.RFC3339)))
-	cumulativeContent.WriteString("==========================================\n\n")
-
-	// Overall network stats (all time)
-	if tt.networkStats != nil {
-		cumulativeContent.WriteString("NETWORK STATISTICS\n")
-		cumulativeContent.WriteString("-----------------\n")
-		cumulativeContent.WriteString("TCP Traffic:\n")
-		cumulativeContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.networkStats.TCPStats.SendBytes, tt.networkStats.TCPStats.SendPkts))
-		cumulativeContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n", tt.networkStats.TCPStats.RecvBytes, tt.networkStats.TCPStats.RecvPkts))
-		cumulativeContent.WriteString("UDP Traffic:\n")
-		cumulativeContent.WriteString(fmt.Sprintf("  Outbound: %d bytes (%d packets)\n", tt.networkStats.UDPStats.SendBytes, tt.networkStats.UDPStats.SendPkts))
-		cumulativeContent.WriteString(fmt.Sprintf("  Inbound:  %d bytes (%d packets)\n\n", tt.networkStats.UDPStats.RecvBytes, tt.networkStats.UDPStats.RecvPkts))
-	}
-
-	// Process stats (all time)
-	cumulativeContent.WriteString("PROCESS STATISTICS\n")
-	cumulativeContent.WriteString("-----------------\n")
-	for processID, stats := range tt.processStats {
-		cumulativeContent.WriteString(fmt.Sprintf("\nProcess: %s\n", processID))
-		if stats.ProcessInfo.IsDocker {
-			cumulativeContent.WriteString("  Type: Docker Container\n")
-			cumulativeContent.WriteString(fmt.Sprintf("  Container ID: %s\n", stats.ProcessInfo.ContainerID))
-		} else {
-			cumulativeContent.WriteString("  Type: Host Process\n")
+		if err := tt.writeStatsToFile("interval", networkStats); err != nil {
+			return err
 		}
-		cumulativeContent.WriteString(fmt.Sprintf("  PID: %d\n", stats.ProcessInfo.PID))
-		cumulativeContent.WriteString(fmt.Sprintf("  Name: %s\n", stats.ProcessInfo.Name))
-		cumulativeContent.WriteString(fmt.Sprintf("  Running Time: %v\n", time.Since(stats.StartTime).Round(time.Second)))
-		cumulativeContent.WriteString("  Traffic:\n")
-		cumulativeContent.WriteString(fmt.Sprintf("    Inbound:  %d bytes (%d packets)\n", stats.TotalBytesIn, stats.TotalPktsIn))
-		cumulativeContent.WriteString(fmt.Sprintf("    Outbound: %d bytes (%d packets)\n", stats.TotalBytesOut, stats.TotalPktsOut))
+	}
 
-		// All active connections
+	// 写入累计统计
+	cumulativeContent := fmt.Sprintf("\n==========================================\n"+
+		"CUMULATIVE TRAFFIC STATISTICS\n"+
+		"Generated at: %v\n"+
+		"==========================================\n\n",
+		now.Format(time.RFC3339))
+
+	if err := tt.writeStatsToFile("cumulative", cumulativeContent); err != nil {
+		return err
+	}
+
+	// 写入网络统计
+	if tt.networkStats != nil {
+		networkStats := fmt.Sprintf("NETWORK STATISTICS\n"+
+			"-----------------\n"+
+			"TCP Traffic:\n"+
+			"  Outbound: %d bytes (%d packets)\n"+
+			"  Inbound:  %d bytes (%d packets)\n"+
+			"UDP Traffic:\n"+
+			"  Outbound: %d bytes (%d packets)\n"+
+			"  Inbound:  %d bytes (%d packets)\n\n",
+			tt.networkStats.TCPStats.SendBytes,
+			tt.networkStats.TCPStats.SendPkts,
+			tt.networkStats.TCPStats.RecvBytes,
+			tt.networkStats.TCPStats.RecvPkts,
+			tt.networkStats.UDPStats.SendBytes,
+			tt.networkStats.UDPStats.SendPkts,
+			tt.networkStats.UDPStats.RecvBytes,
+			tt.networkStats.UDPStats.RecvPkts)
+
+		if err := tt.writeStatsToFile("cumulative", networkStats); err != nil {
+			return err
+		}
+	}
+
+	// 写入进程统计
+	if err := tt.writeStatsToFile("cumulative", "PROCESS STATISTICS\n-----------------\n"); err != nil {
+		return err
+	}
+
+	for processID, stats := range tt.processStats {
+		processHeader := fmt.Sprintf("\nProcess: %s\n", processID)
+		if err := tt.writeStatsToFile("cumulative", processHeader); err != nil {
+			return err
+		}
+
+		processInfo := fmt.Sprintf("  Type: %s\n"+
+			"  PID: %d\n"+
+			"  Name: %s\n"+
+			"  Running Time: %v\n"+
+			"  Traffic:\n"+
+			"    Inbound:  %d bytes (%d packets)\n"+
+			"    Outbound: %d bytes (%d packets)\n",
+			func() string {
+				if stats.ProcessInfo.IsDocker {
+					return fmt.Sprintf("Docker Container\n  Container ID: %s", stats.ProcessInfo.ContainerID)
+				}
+				return "Host Process"
+			}(),
+			stats.ProcessInfo.PID,
+			stats.ProcessInfo.Name,
+			time.Since(stats.StartTime).Round(time.Second),
+			stats.TotalBytesIn,
+			stats.TotalPktsIn,
+			stats.TotalBytesOut,
+			stats.TotalPktsOut)
+
+		if err := tt.writeStatsToFile("cumulative", processInfo); err != nil {
+			return err
+		}
+
+		// 写入连接信息
 		if len(stats.Connections) > 0 {
-			cumulativeContent.WriteString("  Active Connections:\n")
+			if err := tt.writeStatsToFile("cumulative", "  Active Connections:\n"); err != nil {
+				return err
+			}
+
 			for _, conn := range stats.Connections {
 				if conn == nil {
 					continue
 				}
-				cumulativeContent.WriteString(fmt.Sprintf("    %s:%d -> %s:%d\n",
-					conn.SrcIP, conn.SrcPort, conn.DstIP, conn.DstPort))
-				cumulativeContent.WriteString(fmt.Sprintf("      Inbound:  %d bytes (%d packets)\n", conn.BytesIn, conn.PktsIn))
-				cumulativeContent.WriteString(fmt.Sprintf("      Outbound: %d bytes (%d packets)\n", conn.BytesOut, conn.PktsOut))
-				cumulativeContent.WriteString(fmt.Sprintf("      Last Seen: %s\n", conn.LastSeen.Format(time.RFC3339)))
+				connInfo := fmt.Sprintf("    %s:%d -> %s:%d\n"+
+					"      Inbound:  %d bytes (%d packets)\n"+
+					"      Outbound: %d bytes (%d packets)\n"+
+					"      Last Seen: %s\n",
+					conn.SrcIP, conn.SrcPort,
+					conn.DstIP, conn.DstPort,
+					conn.BytesIn, conn.PktsIn,
+					conn.BytesOut, conn.PktsOut,
+					conn.LastSeen.Format(time.RFC3339))
+
+				if err := tt.writeStatsToFile("cumulative", connInfo); err != nil {
+					return err
+				}
 			}
 		}
-		cumulativeContent.WriteString("-----------------\n")
+		if err := tt.writeStatsToFile("cumulative", "-----------------\n"); err != nil {
+			return err
+		}
 	}
 
-	return cumulativeContent.String(), intervalContent.String()
+	return nil
 }
 
 func (tt *TrafficTracker) printStats() {
 	// 先清理不活跃的连接
 	tt.cleanup()
 
-	// 格式化统计数据
-	cumulativeContent, intervalContent := tt.formatStatsForFile()
-
-	// 写入文件
-	if err := tt.writeStatsToFile("cumulative", cumulativeContent); err != nil {
-		fmt.Printf("Error writing cumulative stats: %v\n", err)
+	// 格式化并写入统计数据
+	if err := tt.formatStatsForFile(); err != nil {
+		fmt.Printf("Error writing stats: %v\n", err)
 	}
-	if err := tt.writeStatsToFile("interval", intervalContent); err != nil {
-		fmt.Printf("Error writing interval stats: %v\n", err)
-	}
-
-	// 打印到控制台
-	fmt.Print(cumulativeContent)
-	fmt.Print(intervalContent)
 
 	// 重置间隔统计
 	tt.resetIntervalStats()
