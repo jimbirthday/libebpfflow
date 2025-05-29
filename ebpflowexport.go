@@ -418,10 +418,15 @@ func (tt *TrafficTracker) printStats() {
 }
 
 func (tt *TrafficTracker) resetIntervalStats() {
-	// 保存当前统计作为下一个间隔的基准
-	tt.intervalStats.LastStats = make(map[string]*ProcessStats)
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+
+	// Create a new map for last stats
+	lastStats := make(map[string]*ProcessStats)
+
+	// Safely copy the current stats
 	for k, v := range tt.intervalStats.ProcessStats {
-		// 创建深拷贝
+		// Create deep copy
 		lastStat := &ProcessStats{
 			TotalBytesIn:  v.TotalBytesIn,
 			TotalBytesOut: v.TotalBytesOut,
@@ -432,7 +437,7 @@ func (tt *TrafficTracker) resetIntervalStats() {
 			Connections:   make(map[string]*ConnectionInfo),
 			ProcessInfo:   v.ProcessInfo,
 		}
-		// 复制连接信息
+		// Copy connections
 		for connKey, conn := range v.Connections {
 			lastStat.Connections[connKey] = &ConnectionInfo{
 				SrcIP:    conn.SrcIP,
@@ -446,15 +451,15 @@ func (tt *TrafficTracker) resetIntervalStats() {
 				LastSeen: conn.LastSeen,
 			}
 		}
-		tt.intervalStats.LastStats[k] = lastStat
+		lastStats[k] = lastStat
 	}
 
-	// 重置当前间隔统计
+	// Reset current interval stats with new map
 	tt.intervalStats = &IntervalStats{
 		ProcessStats: make(map[string]*ProcessStats),
 		NetworkStats: &NetworkEventStats{},
 		StartTime:    time.Now(),
-		LastStats:    tt.intervalStats.LastStats,
+		LastStats:    lastStats,
 	}
 }
 

@@ -42,8 +42,11 @@ yum install zeromq -y
 
 yum install -y zeromq-devel
 
+rm /lib/modules/$(uname -r)/build
+
 ln -s /usr/src/kernels/3.10.0-1160.119.1.el7.x86_64 /lib/modules/$(uname -r)/build
 
+yum install -y bcc bcc-tools
 ```
 
 ### Build
