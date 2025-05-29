@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,6 +18,17 @@ import (
 
 var gRUNNING bool = true
 var gLogLevel int = 0 // 0: no logs, 1: errors only, 2: info, 3: debug
+
+// 添加配置常量
+const (
+	DefaultConnTimeout     = 30 * time.Second // 默认连接超时时间
+	DefaultCleanupInterval = 5 * time.Minute  // 默认清理间隔
+	MaxStoredProcesses     = 1000             // 最大存储进程数
+	MaxStoredConnections   = 5000             // 每个进程最大存储连接数
+	MaxStoredIntervals     = 24               // 最大存储间隔数
+	LogFilePrefix          = "ebpflow_"       // 日志文件前缀
+	LogFileSuffix          = ".log"           // 日志文件后缀
+)
 
 // 连接信息结构
 type ConnectionInfo struct {
@@ -77,16 +90,139 @@ type IntervalStats struct {
 	LastStats    map[string]*ProcessStats // 添加上一个间隔的统计
 }
 
+// 日志文件管理器
+type LogFileManager struct {
+	currentHour    int
+	currentDate    string
+	baseDir        string
+	cumulativeFile *os.File
+	intervalFile   *os.File
+	mu             sync.Mutex
+}
+
+func NewLogFileManager(baseDir string) *LogFileManager {
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		fmt.Printf("Error creating log directory: %v\n", err)
+		baseDir = "." // 如果创建目录失败，使用当前目录
+	}
+
+	return &LogFileManager{
+		baseDir:     baseDir,
+		currentHour: time.Now().Hour(),
+		currentDate: time.Now().Format("2006-01-02"),
+	}
+}
+
+// 获取当前日志文件名
+func (lfm *LogFileManager) getLogFileName(logType string) string {
+	now := time.Now()
+	return filepath.Join(lfm.baseDir, fmt.Sprintf("%s%s_%s_%02d%s",
+		LogFilePrefix,
+		logType,
+		now.Format("2006-01-02"),
+		now.Hour(),
+		LogFileSuffix))
+}
+
+// 检查是否需要切换日志文件
+func (lfm *LogFileManager) shouldRotate() bool {
+	now := time.Now()
+	return now.Hour() != lfm.currentHour || now.Format("2006-01-02") != lfm.currentDate
+}
+
+// 切换日志文件
+func (lfm *LogFileManager) rotate() error {
+	lfm.mu.Lock()
+	defer lfm.mu.Unlock()
+
+	// 关闭当前文件
+	if lfm.cumulativeFile != nil {
+		lfm.cumulativeFile.Close()
+	}
+	if lfm.intervalFile != nil {
+		lfm.intervalFile.Close()
+	}
+
+	// 更新当前时间
+	now := time.Now()
+	lfm.currentHour = now.Hour()
+	lfm.currentDate = now.Format("2006-01-02")
+
+	// 打开新的日志文件
+	var err error
+	lfm.cumulativeFile, err = os.OpenFile(
+		lfm.getLogFileName("cumulative"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+		0644,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to open cumulative log file: %v", err)
+	}
+
+	lfm.intervalFile, err = os.OpenFile(
+		lfm.getLogFileName("interval"),
+		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
+		0644,
+	)
+	if err != nil {
+		lfm.cumulativeFile.Close()
+		return fmt.Errorf("failed to open interval log file: %v", err)
+	}
+
+	return nil
+}
+
+// 写入日志
+func (lfm *LogFileManager) writeLog(logType string, content string) error {
+	if lfm.shouldRotate() {
+		if err := lfm.rotate(); err != nil {
+			return err
+		}
+	}
+
+	lfm.mu.Lock()
+	defer lfm.mu.Unlock()
+
+	var file *os.File
+	if logType == "cumulative" {
+		file = lfm.cumulativeFile
+	} else {
+		file = lfm.intervalFile
+	}
+
+	if _, err := file.WriteString(content); err != nil {
+		return fmt.Errorf("failed to write to log file: %v", err)
+	}
+	return nil
+}
+
+// 关闭日志文件
+func (lfm *LogFileManager) close() {
+	lfm.mu.Lock()
+	defer lfm.mu.Unlock()
+
+	if lfm.cumulativeFile != nil {
+		lfm.cumulativeFile.Close()
+	}
+	if lfm.intervalFile != nil {
+		lfm.intervalFile.Close()
+	}
+}
+
 type TrafficTracker struct {
 	processStats  map[string]*ProcessStats
 	networkStats  *NetworkEventStats
 	intervalStats *IntervalStats
 	mu            sync.RWMutex
-	connTimeout   time.Duration // 添加连接超时时间配置
+	connTimeout   time.Duration
+	cleanupTicker *time.Ticker
+	stopCleanup   chan struct{}
+	intervals     []*IntervalStats // 存储历史间隔数据
+	logManager    *LogFileManager
 }
 
 func NewTrafficTracker() *TrafficTracker {
-	return &TrafficTracker{
+	tt := &TrafficTracker{
 		processStats: make(map[string]*ProcessStats),
 		networkStats: &NetworkEventStats{},
 		intervalStats: &IntervalStats{
@@ -95,7 +231,99 @@ func NewTrafficTracker() *TrafficTracker {
 			StartTime:    time.Now(),
 			LastStats:    make(map[string]*ProcessStats),
 		},
-		connTimeout: 30 * time.Second, // 默认30秒超时
+		connTimeout: DefaultConnTimeout,
+		stopCleanup: make(chan struct{}),
+		intervals:   make([]*IntervalStats, 0, MaxStoredIntervals),
+		logManager:  NewLogFileManager("logs"), // 创建日志管理器
+	}
+
+	// 初始化日志文件
+	if err := tt.logManager.rotate(); err != nil {
+		fmt.Printf("Error initializing log files: %v\n", err)
+	}
+
+	tt.startCleanupRoutine()
+	return tt
+}
+
+// 启动定期清理协程
+func (tt *TrafficTracker) startCleanupRoutine() {
+	tt.cleanupTicker = time.NewTicker(DefaultCleanupInterval)
+	go func() {
+		for {
+			select {
+			case <-tt.cleanupTicker.C:
+				tt.cleanup()
+			case <-tt.stopCleanup:
+				tt.cleanupTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// 清理过期和不必要的数据
+func (tt *TrafficTracker) cleanup() {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+
+	now := time.Now()
+
+	// 1. 清理过期连接
+	for _, stats := range tt.processStats {
+		// 清理过期连接
+		for connKey, conn := range stats.Connections {
+			if now.Sub(conn.LastSeen) > tt.connTimeout {
+				delete(stats.Connections, connKey)
+			}
+		}
+
+		// 如果连接数超过限制，删除最旧的连接
+		if len(stats.Connections) > MaxStoredConnections {
+			// 按最后访问时间排序
+			type connWithTime struct {
+				key string
+				t   time.Time
+			}
+			conns := make([]connWithTime, 0, len(stats.Connections))
+			for k, v := range stats.Connections {
+				conns = append(conns, connWithTime{k, v.LastSeen})
+			}
+			sort.Slice(conns, func(i, j int) bool {
+				return conns[i].t.Before(conns[j].t)
+			})
+
+			// 删除最旧的连接直到数量在限制内
+			for i := 0; i < len(conns)-MaxStoredConnections; i++ {
+				delete(stats.Connections, conns[i].key)
+			}
+		}
+	}
+
+	// 2. 清理过期进程
+	if len(tt.processStats) > MaxStoredProcesses {
+		// 按最后访问时间排序
+		type procWithTime struct {
+			key string
+			t   time.Time
+		}
+		procs := make([]procWithTime, 0, len(tt.processStats))
+		for k, v := range tt.processStats {
+			procs = append(procs, procWithTime{k, v.LastSeen})
+		}
+		sort.Slice(procs, func(i, j int) bool {
+			return procs[i].t.Before(procs[j].t)
+		})
+
+		// 删除最旧的进程直到数量在限制内
+		for i := 0; i < len(procs)-MaxStoredProcesses; i++ {
+			delete(tt.processStats, procs[i].key)
+		}
+	}
+
+	// 3. 清理历史间隔数据
+	if len(tt.intervals) > MaxStoredIntervals {
+		tt.intervals = tt.intervals[len(tt.intervals)-MaxStoredIntervals:]
 	}
 }
 
@@ -274,41 +502,8 @@ func (tt *TrafficTracker) updateStats(event ebpf_flow.EBPFevent) {
 	tt.intervalStats.NetworkStats.LastSeen = time.Now()
 }
 
-// 清理不活跃的连接
-func (tt *TrafficTracker) cleanupInactiveConnections() {
-	tt.mu.Lock()
-	defer tt.mu.Unlock()
-
-	now := time.Now()
-	for _, stats := range tt.processStats {
-		for connKey, conn := range stats.Connections {
-			if now.Sub(conn.LastSeen) > tt.connTimeout {
-				delete(stats.Connections, connKey)
-			}
-		}
-	}
-
-	// 清理间隔统计中的不活跃连接
-	for _, stats := range tt.intervalStats.ProcessStats {
-		for connKey, conn := range stats.Connections {
-			if now.Sub(conn.LastSeen) > tt.connTimeout {
-				delete(stats.Connections, connKey)
-			}
-		}
-	}
-}
-
-func (tt *TrafficTracker) writeStatsToFile(filename string, content string) error {
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to open file %s: %v", filename, err)
-	}
-	defer file.Close()
-
-	if _, err := file.WriteString(content); err != nil {
-		return fmt.Errorf("failed to write to file %s: %v", filename, err)
-	}
-	return nil
+func (tt *TrafficTracker) writeStatsToFile(logType string, content string) error {
+	return tt.logManager.writeLog(logType, content)
 }
 
 func (tt *TrafficTracker) formatStatsForFile() (string, string) {
@@ -396,16 +591,16 @@ func (tt *TrafficTracker) formatStatsForFile() (string, string) {
 
 func (tt *TrafficTracker) printStats() {
 	// 先清理不活跃的连接
-	tt.cleanupInactiveConnections()
+	tt.cleanup()
 
 	// 格式化统计数据
 	cumulativeContent, intervalContent := tt.formatStatsForFile()
 
 	// 写入文件
-	if err := tt.writeStatsToFile("cumulative_stats.log", cumulativeContent); err != nil {
+	if err := tt.writeStatsToFile("cumulative", cumulativeContent); err != nil {
 		fmt.Printf("Error writing cumulative stats: %v\n", err)
 	}
-	if err := tt.writeStatsToFile("interval_stats.log", intervalContent); err != nil {
+	if err := tt.writeStatsToFile("interval", intervalContent); err != nil {
 		fmt.Printf("Error writing interval stats: %v\n", err)
 	}
 
@@ -421,12 +616,15 @@ func (tt *TrafficTracker) resetIntervalStats() {
 	tt.mu.Lock()
 	defer tt.mu.Unlock()
 
-	// Create a new map for last stats
-	lastStats := make(map[string]*ProcessStats)
+	// 保存当前间隔到历史记录
+	tt.intervals = append(tt.intervals, tt.intervalStats)
+	if len(tt.intervals) > MaxStoredIntervals {
+		tt.intervals = tt.intervals[1:]
+	}
 
-	// Safely copy the current stats
+	// 创建新的间隔统计
+	lastStats := make(map[string]*ProcessStats)
 	for k, v := range tt.intervalStats.ProcessStats {
-		// Create deep copy
 		lastStat := &ProcessStats{
 			TotalBytesIn:  v.TotalBytesIn,
 			TotalBytesOut: v.TotalBytesOut,
@@ -437,24 +635,26 @@ func (tt *TrafficTracker) resetIntervalStats() {
 			Connections:   make(map[string]*ConnectionInfo),
 			ProcessInfo:   v.ProcessInfo,
 		}
-		// Copy connections
+
+		// 只复制活跃的连接
 		for connKey, conn := range v.Connections {
-			lastStat.Connections[connKey] = &ConnectionInfo{
-				SrcIP:    conn.SrcIP,
-				DstIP:    conn.DstIP,
-				SrcPort:  conn.SrcPort,
-				DstPort:  conn.DstPort,
-				BytesIn:  conn.BytesIn,
-				BytesOut: conn.BytesOut,
-				PktsIn:   conn.PktsIn,
-				PktsOut:  conn.PktsOut,
-				LastSeen: conn.LastSeen,
+			if time.Since(conn.LastSeen) <= tt.connTimeout {
+				lastStat.Connections[connKey] = &ConnectionInfo{
+					SrcIP:    conn.SrcIP,
+					DstIP:    conn.DstIP,
+					SrcPort:  conn.SrcPort,
+					DstPort:  conn.DstPort,
+					BytesIn:  conn.BytesIn,
+					BytesOut: conn.BytesOut,
+					PktsIn:   conn.PktsIn,
+					PktsOut:  conn.PktsOut,
+					LastSeen: conn.LastSeen,
+				}
 			}
 		}
 		lastStats[k] = lastStat
 	}
 
-	// Reset current interval stats with new map
 	tt.intervalStats = &IntervalStats{
 		ProcessStats: make(map[string]*ProcessStats),
 		NetworkStats: &NetworkEventStats{},
@@ -464,7 +664,6 @@ func (tt *TrafficTracker) resetIntervalStats() {
 }
 
 func main() {
-	// 创建流量跟踪器
 	trafficTracker := NewTrafficTracker()
 
 	// 事件处理函数
@@ -473,7 +672,16 @@ func main() {
 	}
 
 	// 创建定时器，定期打印统计信息
-	ticker := time.NewTicker(10 * time.Second)
+	// 计算到下一个5秒整点的延迟
+	now := time.Now()
+	nextTick := now.Truncate(5 * time.Second).Add(5 * time.Second)
+	initialDelay := nextTick.Sub(now)
+
+	// 先等待到下一个5秒整点
+	time.Sleep(initialDelay)
+
+	// 然后开始5秒间隔的计时
+	ticker := time.NewTicker(5 * time.Second)
 	go func() {
 		for range ticker.C {
 			trafficTracker.printStats()
@@ -487,11 +695,17 @@ func main() {
 	}
 
 	// 处理中断信号
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
 		gRUNNING = false
+		// 停止清理协程
+		close(trafficTracker.stopCleanup)
+		// 最后一次清理
+		trafficTracker.cleanup()
+		// 关闭日志文件
+		trafficTracker.logManager.close()
 	}()
 
 	// 轮询事件
