@@ -136,7 +136,10 @@ func (lfm *LogFileManager) getLogFileName(logType string) string {
 // 检查是否需要切换日志文件
 func (lfm *LogFileManager) shouldRotate() bool {
 	now := time.Now()
-	return now.Hour() != lfm.currentHour || now.Format("2006-01-02") != lfm.currentDate
+	// 检查是否到达整点
+	return now.Hour() != lfm.currentHour ||
+		now.Format("2006-01-02") != lfm.currentDate ||
+		now.Minute() == 0 && now.Second() == 0
 }
 
 // 切换日志文件
@@ -634,9 +637,23 @@ func (tt *TrafficTracker) processEventBatch(events []ebpf_flow.EBPFevent) {
 }
 
 func (tt *TrafficTracker) Stop() {
+	// 先关闭事件处理
 	close(tt.eventStop)
 	tt.eventWg.Wait()
 	close(tt.eventChan)
+
+	// 停止清理协程
+	close(tt.stopCleanup)
+	if tt.cleanupTicker != nil {
+		tt.cleanupTicker.Stop()
+	}
+
+	// 最后一次清理和统计
+	tt.cleanup()
+	tt.printStats()
+
+	// 关闭日志文件
+	tt.logManager.close()
 }
 
 func (tt *TrafficTracker) writeStatsToFile(logType string, content string) error {
@@ -666,19 +683,23 @@ func (tt *TrafficTracker) formatStatsForFile() error {
 		networkStats := fmt.Sprintf("NETWORK STATISTICS\n"+
 			"-----------------\n"+
 			"TCP Traffic:\n"+
-			"  Outbound: %d bytes (%d packets)\n"+
-			"  Inbound:  %d bytes (%d packets)\n"+
+			"  Outbound: %d bytes (%d packets) [%.2f bytes/s]\n"+
+			"  Inbound:  %d bytes (%d packets) [%.2f bytes/s]\n"+
 			"UDP Traffic:\n"+
-			"  Outbound: %d bytes (%d packets)\n"+
-			"  Inbound:  %d bytes (%d packets)\n",
+			"  Outbound: %d bytes (%d packets) [%.2f bytes/s]\n"+
+			"  Inbound:  %d bytes (%d packets) [%.2f bytes/s]\n",
 			tt.intervalStats.NetworkStats.TCPStats.SendBytes,
 			tt.intervalStats.NetworkStats.TCPStats.SendPkts,
+			float64(tt.intervalStats.NetworkStats.TCPStats.SendBytes)/60.0,
 			tt.intervalStats.NetworkStats.TCPStats.RecvBytes,
 			tt.intervalStats.NetworkStats.TCPStats.RecvPkts,
+			float64(tt.intervalStats.NetworkStats.TCPStats.RecvBytes)/60.0,
 			tt.intervalStats.NetworkStats.UDPStats.SendBytes,
 			tt.intervalStats.NetworkStats.UDPStats.SendPkts,
+			float64(tt.intervalStats.NetworkStats.UDPStats.SendBytes)/60.0,
 			tt.intervalStats.NetworkStats.UDPStats.RecvBytes,
-			tt.intervalStats.NetworkStats.UDPStats.RecvPkts)
+			tt.intervalStats.NetworkStats.UDPStats.RecvPkts,
+			float64(tt.intervalStats.NetworkStats.UDPStats.RecvBytes)/60.0)
 
 		if err := tt.writeStatsToFile("interval", networkStats); err != nil {
 			return err
@@ -701,19 +722,23 @@ func (tt *TrafficTracker) formatStatsForFile() error {
 		networkStats := fmt.Sprintf("NETWORK STATISTICS\n"+
 			"-----------------\n"+
 			"TCP Traffic:\n"+
-			"  Outbound: %d bytes (%d packets)\n"+
-			"  Inbound:  %d bytes (%d packets)\n"+
+			"  Outbound: %d bytes (%d packets) [%.2f bytes/s]\n"+
+			"  Inbound:  %d bytes (%d packets) [%.2f bytes/s]\n"+
 			"UDP Traffic:\n"+
-			"  Outbound: %d bytes (%d packets)\n"+
-			"  Inbound:  %d bytes (%d packets)\n\n",
+			"  Outbound: %d bytes (%d packets) [%.2f bytes/s]\n"+
+			"  Inbound:  %d bytes (%d packets) [%.2f bytes/s]\n\n",
 			tt.networkStats.TCPStats.SendBytes,
 			tt.networkStats.TCPStats.SendPkts,
+			float64(tt.networkStats.TCPStats.SendBytes)/60.0,
 			tt.networkStats.TCPStats.RecvBytes,
 			tt.networkStats.TCPStats.RecvPkts,
+			float64(tt.networkStats.TCPStats.RecvBytes)/60.0,
 			tt.networkStats.UDPStats.SendBytes,
 			tt.networkStats.UDPStats.SendPkts,
+			float64(tt.networkStats.UDPStats.SendBytes)/60.0,
 			tt.networkStats.UDPStats.RecvBytes,
-			tt.networkStats.UDPStats.RecvPkts)
+			tt.networkStats.UDPStats.RecvPkts,
+			float64(tt.networkStats.UDPStats.RecvBytes)/60.0)
 
 		if err := tt.writeStatsToFile("cumulative", networkStats); err != nil {
 			return err
@@ -736,8 +761,8 @@ func (tt *TrafficTracker) formatStatsForFile() error {
 			"  Name: %s\n"+
 			"  Running Time: %v\n"+
 			"  Traffic:\n"+
-			"    Inbound:  %d bytes (%d packets)\n"+
-			"    Outbound: %d bytes (%d packets)\n",
+			"    Inbound:  %d bytes (%d packets) [%.2f bytes/s]\n"+
+			"    Outbound: %d bytes (%d packets) [%.2f bytes/s]\n",
 			func() string {
 				if stats.ProcessInfo.IsDocker {
 					return fmt.Sprintf("Docker Container\n  Container ID: %s", stats.ProcessInfo.ContainerID)
@@ -749,8 +774,10 @@ func (tt *TrafficTracker) formatStatsForFile() error {
 			time.Since(stats.StartTime).Round(time.Second),
 			stats.TotalBytesIn,
 			stats.TotalPktsIn,
+			float64(stats.TotalBytesIn)/60.0,
 			stats.TotalBytesOut,
-			stats.TotalPktsOut)
+			stats.TotalPktsOut,
+			float64(stats.TotalBytesOut)/60.0)
 
 		if err := tt.writeStatsToFile("cumulative", processInfo); err != nil {
 			return err
@@ -847,7 +874,9 @@ func (tt *TrafficTracker) resetIntervalStats() {
 }
 
 func main() {
+	fmt.Println("Starting initialization...")
 	trafficTracker := NewTrafficTracker()
+	fmt.Println("Traffic tracker initialized")
 
 	// 事件处理函数
 	eventHandler := func(event ebpf_flow.EBPFevent) {
@@ -862,20 +891,22 @@ func main() {
 		}
 	}
 
+	fmt.Println("Setting up timers...")
 	// 创建定时器，定期打印统计信息
-	// 计算到下一个5秒整点的延迟
+	// 计算到下一个1分钟整点的延迟
 	now := time.Now()
-	nextTick := now.Truncate(5 * time.Second).Add(5 * time.Second)
+	nextTick := now.Truncate(time.Minute).Add(time.Minute)
 	initialDelay := nextTick.Sub(now)
 
-	// 先等待到下一个5秒整点
+	// 先等待到下一个1分钟整点
+	fmt.Printf("Waiting %v for next minute mark...\n", initialDelay)
 	time.Sleep(initialDelay)
 
 	// 创建一个done通道用于优雅关闭
 	done := make(chan struct{})
 
-	// 然后开始5秒间隔的计时
-	ticker := time.NewTicker(5 * time.Second)
+	// 然后开始1分钟间隔的计时
+	ticker := time.NewTicker(time.Minute)
 	go func() {
 		defer ticker.Stop()
 		for {
@@ -887,11 +918,13 @@ func main() {
 			}
 		}
 	}()
+	fmt.Println("Timer setup completed")
 
 	// 初始化 ebpflow
+	fmt.Println("Initializing ebpflow...")
 	ebpf := ebpf_flow.NewEbpflow(eventHandler, 0)
 	if gLogLevel > 1 {
-		fmt.Println("Initialized")
+		fmt.Println("Ebpflow initialized")
 	}
 
 	// 处理中断信号
@@ -910,18 +943,13 @@ func main() {
 		// 通知所有组件开始关闭
 		close(shutdown)
 
-		// 等待一小段时间确保最后的统计被写入
-		time.Sleep(2 * time.Second)
+		// 停止 ebpflow
+		fmt.Println("Stopping ebpflow...")
+		ebpf.Close()
 
-		// 停止清理协程
-		close(trafficTracker.stopCleanup)
-
-		// 最后一次清理和统计
-		trafficTracker.cleanup()
-		trafficTracker.printStats()
-
-		// 关闭日志文件
-		trafficTracker.logManager.close()
+		// 停止 traffic tracker
+		fmt.Println("Stopping traffic tracker...")
+		trafficTracker.Stop()
 
 		// 通知主循环可以退出了
 		close(done)
@@ -929,7 +957,7 @@ func main() {
 
 	// 在信号处理协程中添加事件统计报告
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
 		for {
@@ -959,14 +987,12 @@ func main() {
 			gRUNNING = false
 		default:
 			// 轮询事件，但使用较短的超时时间
-			ebpf.PollEvent(100) // 使用100ms超时，这样能更快响应关闭信号
+			ebpf.PollEvent(100)
+			// 由于PollEvent没有返回值，我们不需要检查错误
 		}
 	}
 
 	fmt.Println("Cleaning up resources...")
-
-	// 清理资源
-	ebpf.Close()
 
 	// 等待所有组件完成清理
 	<-done
