@@ -1,4 +1,7 @@
 // ebpflowexport.go
+//go:build cgo
+// +build cgo
+
 package main
 
 import (
@@ -12,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,44 +29,117 @@ var gLogLevel int = 2 // 设置为debug级别
 
 // 修改常量定义，增加更细粒度的控制
 const (
-	DefaultConnTimeout      = 30 * time.Second   // 默认连接超时时间
-	DefaultCleanupInterval  = 1 * time.Minute    // 减少清理间隔到1分钟
-	MaxStoredProcesses      = 1000               // 最大存储进程数
-	MaxStoredConnections    = 5000               // 每个进程最大存储连接数
-	MaxStoredIntervals      = 12                 // 减少存储的间隔数到12个（1小时）
-	LogFilePrefix           = "ebpflow_"         // 日志文件前缀
-	LogFileSuffix           = ".log"             // 日志文件后缀
-	MaxLogFileSize          = 100 * 1024 * 1024  // 最大日志文件大小（100MB）
-	LogBufferSize           = 32 * 1024          // 增加日志缓冲区大小到32KB
-	EventBufferSize         = 1024 * 1024        // 增加事件缓冲区大小到1MB
-	EventBatchSize          = 100                // 每次处理的事件批大小
-	EventProcessTimeout     = 50                 // 事件处理超时时间(ms)
-	MaxMemoryUsage          = 1024 * 1024 * 1024 // 1GB 最大内存使用
-	MemoryWarningThreshold  = 768 * 1024 * 1024  // 768MB 内存警告阈值
-	MemoryCriticalThreshold = 896 * 1024 * 1024  // 896MB 内存临界阈值
+	DefaultConnTimeout      = 30 * time.Second     // 默认连接超时时间
+	DefaultCleanupInterval  = 1 * time.Minute      // 减少清理间隔到1分钟
+	MaxStoredProcesses      = 500                  // 减少最大存储进程数到500
+	MaxStoredConnections    = 2000                 // 减少每个进程最大存储连接数到2000
+	MaxStoredIntervals      = 6                    // 减少存储的间隔数到6个（30分钟）
+	LogFilePrefix           = "ebpflow_"           // 日志文件前缀
+	LogFileSuffix           = ".log"               // 日志文件后缀
+	MaxLogFileSize          = 50 * 1024 * 1024     // 减少最大日志文件大小到50MB
+	LogBufferSize           = 16 * 1024            // 减少日志缓冲区大小到16KB
+	EventBufferSize         = 1024 * 1024 * 2      // 减少到2MB
+	EventBatchSize          = 1000                 // 减少批处理大小到1000
+	EventProcessTimeoutMs   = 200                  // 处理超时时间
+	EventProcessInterval    = 2 * time.Millisecond // 处理间隔
+	MaxMemoryUsage          = 1024 * 1024 * 1024   // 1GB 最大内存使用
+	MemoryWarningThreshold  = 768 * 1024 * 1024    // 768MB 内存警告阈值
+	MemoryCriticalThreshold = 896 * 1024 * 1024    // 896MB 内存临界阈值
+
+	// 新增常量
+	NumWorkerGoroutines   = 8     // 减少工作协程数量到8
+	EventQueueSize        = 50000 // 减少队列大小到5万
+	EventDropThreshold    = 2000  // 减少丢弃阈值到2000
+	EventProcessBatchSize = 1000  // 减少事件批处理大小到1000
+
+	// 系统负载相关常量
+	MaxSystemLoad     = 80.0                   // 最大系统负载百分比
+	LoadCheckInterval = 5 * time.Second        // 负载检查间隔
+	MinIdleTime       = 100 * time.Millisecond // 最小空闲时间
+
+	// 事件过滤相关常量
+	MinPacketSize    = 64                   // 最小数据包大小
+	MaxPacketSize    = 1500                 // 最大数据包大小
+	MinEventInterval = 1 * time.Millisecond // 最小事件间隔
 
 	// 清理策略
-	AggressiveCleanupThreshold = 512 * 1024 * 1024 // 512MB 触发激进清理
-	EmergencyCleanupThreshold  = 768 * 1024 * 1024 // 768MB 触发紧急清理
+	AggressiveCleanupThreshold = 768 * 1024 * 1024 // 768MB 触发激进清理
+	EmergencyCleanupThreshold  = 896 * 1024 * 1024 // 896MB 触发紧急清理
 
 	// 监控间隔
-	MemoryCheckInterval = 30 * time.Second // 内存检查间隔
-	CleanupInterval     = 1 * time.Minute  // 清理间隔
+	MemoryCheckInterval = 15 * time.Second // 减少内存检查间隔到15秒
+	CleanupInterval     = 30 * time.Second // 减少清理间隔到30秒
 
 	// 日志文件配置
-	LogFileMaxSize    = 100 * 1024 * 1024 // 100MB
-	LogFileMaxAge     = 24 * time.Hour    // 24小时
-	LogFileMaxBackups = 7                 // 保留7个备份
-	LogFileCompress   = true              // 压缩旧日志
-	LogFileLocalTime  = true              // 使用本地时间
-	LogFileBufferSize = 32 * 1024         // 32KB 缓冲区
+	LogFileMaxSize    = 50 * 1024 * 1024 // 50MB
+	LogFileMaxAge     = 12 * time.Hour   // 12小时
+	LogFileMaxBackups = 3                // 保留3个备份
+	LogFileCompress   = true             // 压缩旧日志
+	LogFileLocalTime  = true             // 使用本地时间
+	LogFileBufferSize = 16 * 1024        // 16KB 缓冲区
 
 	// 添加智能清理相关常量
-	MinCleanupInterval    = 30 * time.Second // 最小清理间隔
-	MaxCleanupInterval    = 5 * time.Minute  // 最大清理间隔
-	CleanupIntervalStep   = 30 * time.Second // 清理间隔调整步长
-	AdaptiveCleanupWindow = 10               // 自适应清理窗口大小
+	MinCleanupInterval    = 15 * time.Second // 最小清理间隔
+	MaxCleanupInterval    = 2 * time.Minute  // 最大清理间隔
+	CleanupIntervalStep   = 15 * time.Second // 清理间隔调整步长
+	AdaptiveCleanupWindow = 5                // 自适应清理窗口大小
+
+	// 事件类型常量
+	eTCP_ACPT      = 100
+	eTCP_CONN      = 101
+	eTCP_RETR      = 200
+	eUDP_RECV      = 210
+	eUDP_SEND      = 211
+	eTCP_CLOSE     = 300
+	eTCP_CONN_FAIL = 500
+	eTCP_SEND      = 600
+	eTCP_RECV      = 601
 )
+
+// 新增事件优先级结构
+type EventPriority int
+
+const (
+	PriorityHigh EventPriority = iota
+	PriorityNormal
+	PriorityLow
+)
+
+// 新增事件结构
+type Event struct {
+	Data     ebpf_flow.EBPFevent
+	Priority EventPriority
+	Time     time.Time
+}
+
+// 新增事件队列结构
+type EventQueue struct {
+	highPriority   chan Event
+	normalPriority chan Event
+	lowPriority    chan Event
+	stop           chan struct{}
+}
+
+// 新增事件处理器结构
+type EventProcessor struct {
+	queues     []*EventQueue
+	workers    []*EventWorker
+	stop       chan struct{}
+	wg         sync.WaitGroup
+	stats      *EventStats
+	memMonitor *MemoryMonitor
+	tracker    *TrafficTracker
+	procStats  *EventProcessingStats
+}
+
+// 新增事件工作器结构
+type EventWorker struct {
+	id        int
+	queue     *EventQueue
+	stop      chan struct{}
+	stats     *EventStats
+	processor *EventProcessor
+}
 
 // 连接信息结构
 type ConnectionInfo struct {
@@ -72,9 +149,9 @@ type ConnectionInfo struct {
 	DstPort  uint16
 	BytesIn  uint64
 	BytesOut uint64
-	PktsIn   uint32 // 改用uint32，因为包数量通常不会超过uint32范围
-	PktsOut  uint32 // 改用uint32，因为包数量通常不会超过uint32范围
-	LastSeen int64  // 使用int64存储Unix时间戳，减少内存占用
+	PktsIn   uint32
+	PktsOut  uint32
+	LastSeen int64
 }
 
 // 进程信息结构
@@ -90,10 +167,10 @@ type ProcessInfo struct {
 type ProcessStats struct {
 	TotalBytesIn  uint64
 	TotalBytesOut uint64
-	TotalPktsIn   uint32 // 改用uint32
-	TotalPktsOut  uint32 // 改用uint32
-	LastSeen      int64  // 使用int64存储Unix时间戳
-	StartTime     int64  // 使用int64存储Unix时间戳
+	TotalPktsIn   uint32
+	TotalPktsOut  uint32
+	LastSeen      int64
+	StartTime     int64
 	Connections   map[string]*ConnectionInfo
 	ProcessInfo   ProcessInfo
 }
@@ -103,25 +180,25 @@ type NetworkEventStats struct {
 	TCPStats struct {
 		SendBytes uint64
 		RecvBytes uint64
-		SendPkts  uint32 // 改用uint32
-		RecvPkts  uint32 // 改用uint32
+		SendPkts  uint32
+		RecvPkts  uint32
 	}
 	UDPStats struct {
 		SendBytes uint64
 		RecvBytes uint64
-		SendPkts  uint32 // 改用uint32
-		RecvPkts  uint32 // 改用uint32
+		SendPkts  uint32
+		RecvPkts  uint32
 	}
-	LastSeen int64 // 使用int64存储Unix时间戳
+	LastSeen int64
 }
 
 // 时间间隔统计结构
 type IntervalStats struct {
 	ProcessStats map[string]*ProcessStats
 	NetworkStats *NetworkEventStats
-	StartTime    int64                    // 改为int64
-	EndTime      int64                    // 改为int64
-	LastStats    map[string]*ProcessStats // 添加上一个间隔的统计
+	StartTime    int64
+	EndTime      int64
+	LastStats    map[string]*ProcessStats
 }
 
 // 日志文件管理器
@@ -403,6 +480,16 @@ type EventStats struct {
 	mu              sync.Mutex
 }
 
+// 添加事件处理统计结构
+type EventProcessingStats struct {
+	TotalEvents     uint64
+	ProcessedEvents uint64
+	LostEvents      uint64
+	ProcessingTime  time.Duration
+	LastUpdate      time.Time
+	mu              sync.Mutex
+}
+
 func (es *EventStats) Update(total, lost uint64) {
 	es.mu.Lock()
 	defer es.mu.Unlock()
@@ -442,11 +529,12 @@ func (mm *MemoryMonitor) checkMemory() (bool, bool) {
 	needCleanup := false
 	needEmergency := false
 
-	if m.Alloc > MemoryCriticalThreshold {
+	// 使用更激进的内存阈值
+	if m.Alloc > uint64(MemoryCriticalThreshold) {
 		mm.criticalCount++
 		needEmergency = true
 		needCleanup = true
-	} else if m.Alloc > MemoryWarningThreshold {
+	} else if m.Alloc > uint64(MemoryWarningThreshold) {
 		mm.warningCount++
 		needCleanup = true
 	}
@@ -515,6 +603,104 @@ func (ac *AdaptiveCleanup) updateInterval(success bool) time.Duration {
 	return avgInterval
 }
 
+// 添加系统负载监控结构
+type SystemLoadMonitor struct {
+	lastCheck   time.Time
+	currentLoad float64
+	mu          sync.RWMutex
+	stop        chan struct{}
+}
+
+// 添加事件过滤器结构
+type EventFilter struct {
+	lastEventTime time.Time
+	mu            sync.Mutex
+}
+
+// 创建新的系统负载监控器
+func NewSystemLoadMonitor() *SystemLoadMonitor {
+	return &SystemLoadMonitor{
+		lastCheck: time.Now(),
+		stop:      make(chan struct{}),
+	}
+}
+
+// 启动系统负载监控
+func (slm *SystemLoadMonitor) Start() {
+	go func() {
+		ticker := time.NewTicker(LoadCheckInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				slm.updateLoad()
+			case <-slm.stop:
+				return
+			}
+		}
+	}()
+}
+
+// 更新系统负载
+func (slm *SystemLoadMonitor) updateLoad() {
+	// 读取系统负载
+	load, err := getSystemLoad()
+	if err != nil {
+		return
+	}
+
+	slm.mu.Lock()
+	slm.currentLoad = load
+	slm.lastCheck = time.Now()
+	slm.mu.Unlock()
+}
+
+// 获取当前系统负载
+func (slm *SystemLoadMonitor) GetCurrentLoad() float64 {
+	slm.mu.RLock()
+	defer slm.mu.RUnlock()
+	return slm.currentLoad
+}
+
+// 检查系统是否过载
+func (slm *SystemLoadMonitor) IsOverloaded() bool {
+	return slm.GetCurrentLoad() > MaxSystemLoad
+}
+
+// 停止监控
+func (slm *SystemLoadMonitor) Stop() {
+	close(slm.stop)
+}
+
+// 创建新的事件过滤器
+func NewEventFilter() *EventFilter {
+	return &EventFilter{
+		lastEventTime: time.Now(),
+	}
+}
+
+// 检查事件是否应该被过滤
+func (ef *EventFilter) ShouldFilter(event ebpf_flow.EBPFevent) bool {
+	ef.mu.Lock()
+	defer ef.mu.Unlock()
+
+	now := time.Now()
+
+	// 检查事件间隔
+	if now.Sub(ef.lastEventTime) < MinEventInterval {
+		return true
+	}
+
+	// 检查数据包大小
+	if event.Len < MinPacketSize || event.Len > MaxPacketSize {
+		return true
+	}
+
+	ef.lastEventTime = now
+	return false
+}
+
 type TrafficTracker struct {
 	processStats  map[string]*ProcessStats
 	networkStats  *NetworkEventStats
@@ -525,11 +711,11 @@ type TrafficTracker struct {
 	stopCleanup   chan struct{}
 	intervals     []*IntervalStats
 	logManager    *LogFileManager
-	lastCleanup   int64 // 改为int64
+	lastCleanup   int64
 	memStats      struct {
 		totalConnections int
 		totalProcesses   int
-		lastReport       int64 // 改为int64
+		lastReport       int64
 	}
 	eventStats      *EventStats
 	eventChan       chan ebpf_flow.EBPFevent
@@ -537,6 +723,9 @@ type TrafficTracker struct {
 	eventWg         sync.WaitGroup
 	memMonitor      *MemoryMonitor
 	adaptiveCleanup *AdaptiveCleanup
+	eventProcessor  *EventProcessor
+	loadMonitor     *SystemLoadMonitor
+	eventFilter     *EventFilter
 }
 
 // 添加对象池来重用ConnectionInfo对象
@@ -564,13 +753,13 @@ func putConnectionInfo(conn *ConnectionInfo) {
 
 func NewTrafficTracker() *TrafficTracker {
 	tt := &TrafficTracker{
-		processStats: make(map[string]*ProcessStats, MaxStoredProcesses),
+		processStats: make(map[string]*ProcessStats), // 不预分配容量
 		networkStats: &NetworkEventStats{},
 		intervalStats: &IntervalStats{
-			ProcessStats: make(map[string]*ProcessStats, MaxStoredProcesses),
+			ProcessStats: make(map[string]*ProcessStats), // 不预分配容量
 			NetworkStats: &NetworkEventStats{},
 			StartTime:    time.Now().Unix(),
-			LastStats:    make(map[string]*ProcessStats, MaxStoredProcesses),
+			LastStats:    make(map[string]*ProcessStats), // 不预分配容量
 		},
 		connTimeout: DefaultConnTimeout,
 		stopCleanup: make(chan struct{}),
@@ -586,11 +775,19 @@ func NewTrafficTracker() *TrafficTracker {
 		adaptiveCleanup: &AdaptiveCleanup{
 			intervals: make([]time.Duration, 0, AdaptiveCleanupWindow),
 		},
+		loadMonitor: NewSystemLoadMonitor(),
+		eventFilter: NewEventFilter(),
 	}
+
+	// 初始化事件处理器
+	tt.eventProcessor = NewEventProcessor(NumWorkerGoroutines, tt)
 
 	if err := tt.logManager.rotate(); err != nil {
 		fmt.Printf("Error initializing log files: %v\n", err)
 	}
+
+	// 启动系统负载监控
+	tt.loadMonitor.Start()
 
 	tt.startCleanupRoutine()
 	tt.startEventProcessor()
@@ -710,6 +907,7 @@ func (tt *TrafficTracker) cleanup() {
 		for connKey, conn := range stats.Connections {
 			if now-conn.LastSeen > int64(tt.connTimeout.Seconds()) {
 				delete(stats.Connections, connKey)
+				putConnectionInfo(conn) // 归还对象到对象池
 				continue
 			}
 			activeConnections++
@@ -735,7 +933,9 @@ func (tt *TrafficTracker) cleanup() {
 
 			// 删除最旧的连接直到数量在限制内
 			for i := 0; i < len(conns)-MaxStoredConnections; i++ {
+				conn := stats.Connections[conns[i].key]
 				delete(stats.Connections, conns[i].key)
+				putConnectionInfo(conn) // 归还对象到对象池
 			}
 			activeConnections = len(stats.Connections)
 		}
@@ -774,8 +974,8 @@ func (tt *TrafficTracker) cleanup() {
 	tt.memStats.lastReport = now
 	tt.lastCleanup = now
 
-	// 如果距离上次报告超过1小时，输出内存使用情况
-	if now-tt.memStats.lastReport > 3600 {
+	// 如果距离上次报告超过30分钟，输出内存使用情况
+	if now-tt.memStats.lastReport > 1800 {
 		fmt.Printf("Memory stats - Active connections: %d, Active processes: %d, Alloc: %v MiB, Sys: %v MiB, Memory freed: %v MiB\n",
 			tt.memStats.totalConnections, tt.memStats.totalProcesses,
 			afterMem.Alloc/1024/1024, afterMem.Sys/1024/1024,
@@ -796,6 +996,7 @@ func (tt *TrafficTracker) emergencyCleanup() {
 		for connKey, conn := range stats.Connections {
 			if now-conn.LastSeen > int64(tt.connTimeout.Seconds()/2) { // 更激进的超时
 				delete(stats.Connections, connKey)
+				putConnectionInfo(conn) // 归还对象到对象池
 			}
 		}
 
@@ -819,7 +1020,9 @@ func (tt *TrafficTracker) emergencyCleanup() {
 
 			// 删除一半的连接
 			for i := 0; i < len(conns)/2; i++ {
+				conn := stats.Connections[conns[i].key]
 				delete(stats.Connections, conns[i].key)
+				putConnectionInfo(conn) // 归还对象到对象池
 			}
 		}
 
@@ -1057,29 +1260,21 @@ func (tt *TrafficTracker) processEventBatch(events []ebpf_flow.EBPFevent) {
 			conn.BytesOut += uint64(event.Len)
 			tt.networkStats.TCPStats.SendBytes += uint64(event.Len)
 			tt.networkStats.TCPStats.SendPkts++
-			tt.intervalStats.NetworkStats.TCPStats.SendBytes += uint64(event.Len)
-			tt.intervalStats.NetworkStats.TCPStats.SendPkts++
 		case 601: // eTCP_RECV
 			conn.PktsIn++
 			conn.BytesIn += uint64(event.Len)
 			tt.networkStats.TCPStats.RecvBytes += uint64(event.Len)
 			tt.networkStats.TCPStats.RecvPkts++
-			tt.intervalStats.NetworkStats.TCPStats.RecvBytes += uint64(event.Len)
-			tt.intervalStats.NetworkStats.TCPStats.RecvPkts++
 		case 700: // eUDP_SEND
 			conn.PktsOut++
 			conn.BytesOut += uint64(event.Len)
 			tt.networkStats.UDPStats.SendBytes += uint64(event.Len)
 			tt.networkStats.UDPStats.SendPkts++
-			tt.intervalStats.NetworkStats.UDPStats.SendBytes += uint64(event.Len)
-			tt.intervalStats.NetworkStats.UDPStats.SendPkts++
 		case 701: // eUDP_RECV
 			conn.PktsIn++
 			conn.BytesIn += uint64(event.Len)
 			tt.networkStats.UDPStats.RecvBytes += uint64(event.Len)
 			tt.networkStats.UDPStats.RecvPkts++
-			tt.intervalStats.NetworkStats.UDPStats.RecvBytes += uint64(event.Len)
-			tt.intervalStats.NetworkStats.UDPStats.RecvPkts++
 		}
 		conn.LastSeen = now
 	}
@@ -1189,6 +1384,9 @@ func (tt *TrafficTracker) Stop() {
 
 	// 关闭日志文件
 	tt.logManager.close()
+
+	// 停止系统负载监控
+	tt.loadMonitor.Stop()
 }
 
 func (tt *TrafficTracker) writeStatsToFile(logType string, content string) error {
@@ -1348,7 +1546,40 @@ func (tt *TrafficTracker) formatStatsForFile() error {
 		}
 	}
 
+	// 在写入完所有日志后，清理累计统计数据和间隔统计数据
+	tt.clearCumulativeStats()
+	tt.clearIntervalStats()
+
 	return nil
+}
+
+// 新增清理累计统计数据的方法
+func (tt *TrafficTracker) clearCumulativeStats() {
+	// 重置网络统计
+	tt.networkStats = &NetworkEventStats{}
+
+	// 清理进程统计
+	for pid, stats := range tt.processStats {
+		// 保留进程基本信息，但重置统计数据
+		tt.processStats[pid] = &ProcessStats{
+			StartTime:   stats.StartTime,
+			Connections: make(map[string]*ConnectionInfo),
+			ProcessInfo: stats.ProcessInfo,
+		}
+	}
+}
+
+// 新增清理间隔统计数据的方法
+func (tt *TrafficTracker) clearIntervalStats() {
+	now := time.Now().Unix()
+
+	// 重置间隔统计
+	tt.intervalStats = &IntervalStats{
+		ProcessStats: make(map[string]*ProcessStats),
+		NetworkStats: &NetworkEventStats{},
+		StartTime:    now,
+		LastStats:    make(map[string]*ProcessStats),
+	}
 }
 
 func (tt *TrafficTracker) printStats() {
@@ -1406,6 +1637,147 @@ func (tt *TrafficTracker) resetIntervalStats() {
 		StartTime:    now,
 		LastStats:    make(map[string]*ProcessStats, MaxStoredProcesses),
 	}
+}
+
+// 新增事件队列方法
+func NewEventQueue() *EventQueue {
+	return &EventQueue{
+		highPriority:   make(chan Event, EventQueueSize),
+		normalPriority: make(chan Event, EventQueueSize),
+		lowPriority:    make(chan Event, EventQueueSize),
+		stop:           make(chan struct{}),
+	}
+}
+
+// 新增事件处理器方法
+func NewEventProcessor(numWorkers int, tracker *TrafficTracker) *EventProcessor {
+	ep := &EventProcessor{
+		queues:     make([]*EventQueue, numWorkers),
+		workers:    make([]*EventWorker, numWorkers),
+		stop:       make(chan struct{}),
+		stats:      &EventStats{},
+		memMonitor: &MemoryMonitor{},
+		tracker:    tracker,
+		procStats:  &EventProcessingStats{},
+	}
+
+	for i := 0; i < numWorkers; i++ {
+		ep.queues[i] = NewEventQueue()
+		ep.workers[i] = &EventWorker{
+			id:        i,
+			queue:     ep.queues[i],
+			stop:      make(chan struct{}),
+			stats:     ep.stats,
+			processor: ep,
+		}
+		go ep.workers[i].start()
+	}
+
+	return ep
+}
+
+// 新增事件工作器方法
+func (w *EventWorker) start() {
+	batch := make([]Event, 0, EventProcessBatchSize)
+	ticker := time.NewTicker(EventProcessInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-w.stop:
+			return
+		case event := <-w.queue.highPriority:
+			batch = append(batch, event)
+		case event := <-w.queue.normalPriority:
+			batch = append(batch, event)
+		case event := <-w.queue.lowPriority:
+			batch = append(batch, event)
+		case <-ticker.C:
+			if len(batch) > 0 {
+				w.processBatch(batch)
+				batch = batch[:0]
+			}
+		}
+	}
+}
+
+func (w *EventWorker) processBatch(events []Event) {
+	start := time.Now()
+	processed := uint64(0)
+	lost := uint64(0)
+
+	for _, event := range events {
+		if w.processor != nil {
+			w.processor.processEvent(event.Data)
+			processed++
+		} else {
+			lost++
+		}
+	}
+
+	// 更新统计信息
+	processingTime := time.Since(start)
+	w.processor.updateStats(processed, lost, processingTime)
+
+	// 检查处理时间
+	if processingTime > EventProcessTimeoutMs*time.Millisecond {
+		w.stats.Update(0, uint64(len(events)))
+	} else {
+		w.stats.Update(processed, lost)
+	}
+}
+
+// 更新事件处理逻辑
+func (ep *EventProcessor) processEvent(event ebpf_flow.EBPFevent) {
+	// 检查系统负载
+	if ep.tracker.loadMonitor.IsOverloaded() {
+		// 系统过载时，增加事件过滤
+		if ep.tracker.eventFilter.ShouldFilter(event) {
+			return
+		}
+	}
+
+	start := time.Now()
+
+	if ep.tracker != nil {
+		ep.tracker.updateStats(event)
+	}
+
+	processingTime := time.Since(start)
+	ep.updateStats(1, 0, processingTime)
+}
+
+func (ep *EventProcessor) updateStats(processed, lost uint64, processingTime time.Duration) {
+	ep.procStats.mu.Lock()
+	defer ep.procStats.mu.Unlock()
+
+	ep.procStats.TotalEvents += processed + lost
+	ep.procStats.ProcessedEvents += processed
+	ep.procStats.LostEvents += lost
+	ep.procStats.ProcessingTime += processingTime
+	ep.procStats.LastUpdate = time.Now()
+}
+
+// 获取系统负载的辅助函数
+func getSystemLoad() (float64, error) {
+	// 在 Linux 系统上读取 /proc/loadavg
+	content, err := os.ReadFile("/proc/loadavg")
+	if err != nil {
+		return 0, err
+	}
+
+	// 解析负载值
+	fields := strings.Fields(string(content))
+	if len(fields) < 1 {
+		return 0, fmt.Errorf("invalid loadavg format")
+	}
+
+	load, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return load * 100, nil // 转换为百分比
 }
 
 func main() {
